@@ -67,12 +67,10 @@ class MemoryLogHandler(logging.Handler):
 logger = logging.getLogger("scribd")
 logger.setLevel(logging.INFO)
 
-# Console output
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(console_handler)
 
-# In-memory output for /log
 memory_handler = MemoryLogHandler()
 memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
 logger.addHandler(memory_handler)
@@ -224,13 +222,8 @@ class BrowserManager:
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
                 
-                # --- SPEED & MEMORY FLAGS ---
-                opts.add_argument("--aggressive-cache-discard")
-                opts.add_argument("--disable-background-timer-throttling")
-                opts.add_argument("--disable-backgrounding-occluded-windows")
-                opts.add_argument("--disable-renderer-backgrounding")
-                opts.add_argument("--disable-ipc-flooding-protection")
-                opts.add_argument("--memory-pressure-off")
+                # --- SPEED FLAGS ---
+                opts.add_argument("--js-flags=--max-old-space-size=192")
                 opts.add_argument("--disable-extensions")
                 opts.add_argument("--disable-background-networking")
                 opts.add_argument("--disable-default-apps")
@@ -240,7 +233,12 @@ class BrowserManager:
                 opts.add_argument("--no-first-run")
                 opts.add_argument("--safebrowsing-disable-auto-update")
                 opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
-                opts.add_argument("--js-flags=--max-old-space-size=192")
+                opts.add_argument("--aggressive-cache-discard")
+                opts.add_argument("--disable-background-timer-throttling")
+                opts.add_argument("--disable-backgrounding-occluded-windows")
+                opts.add_argument("--disable-renderer-backgrounding")
+                opts.add_argument("--disable-ipc-flooding-protection")
+                opts.add_argument("--memory-pressure-off")
                 
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -384,7 +382,7 @@ def load_page_batch(driver, nums, timeout=120):
                     if (!p._imagesTurnedOn) p.turnOnImages();
                 } catch (e) { s.error = String(e); ready++; continue; }
                 const imgs = Array.from(p.innerPageElem.querySelectorAll('img'));
-                if (imgs.every(i => i.complete)) ready++;
+                if (imgs.every(i => i.complete || i.naturalWidth === 0)) ready++;
             }
             if (ready === states.length) {
                 clearInterval(timer);
@@ -393,7 +391,7 @@ def load_page_batch(driver, nums, timeout=120):
             }
             if (Date.now() - start >= timeoutMs) {
                 clearInterval(timer);
-                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
+                done({supported: true, failed: states.filter(s => s.error || !s.page.innerPageElem).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
             }
         }, 50);
     """, list(nums), timeout * 1000)
@@ -402,7 +400,6 @@ def load_page_batch(driver, nums, timeout=120):
     return result
 
 def preload_pages_async(driver, nums):
-    """Trigger page loads without waiting — fire and forget."""
     driver.execute_script("""
         const mgr = window.docManager;
         if (!mgr || !mgr.pages) return;
@@ -416,7 +413,6 @@ def preload_pages_async(driver, nums):
     """, list(nums))
 
 def wait_for_batch_ready(driver, nums, timeout=120):
-    """Wait for already-triggered pages. Returns True if successful, False if timeout."""
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
         const nums = arguments[0], ms = arguments[1];
@@ -429,7 +425,7 @@ def wait_for_batch_ready(driver, nums, timeout=120):
             for (const n of nums) {
                 const p = mgr.pages[n];
                 if (!p || !p.innerPageElem) continue;
-                if (Array.from(p.innerPageElem.querySelectorAll('img')).every(i => i.complete)) ok++;
+                if (Array.from(p.innerPageElem.querySelectorAll('img')).every(i => i.complete || i.naturalWidth === 0)) ok++;
             }
             if (ok === nums.length) {
                 clearInterval(t); done(true);
@@ -592,7 +588,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                         just_reset = False
                     else:
                         if not wait_for_batch_ready(driver, batch):
-                            logger.warning(f"Batch {i+1}-{batch_end} timed out during wait. Forcing reload.")
+                            logger.warning(f"Batch {i+1}-{batch_end} timed out during preload. Forcing reload.")
                             res = load_page_batch(driver, batch)
                         else:
                             res = {"failed": []}
@@ -600,7 +596,6 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     if res.get("failed"):
                         logger.warning(f"Some pages in batch failed: {res['failed']}")
 
-                    # Fire off NEXT batch NOW while we start exporting this one
                     next_start = batch_end + 1
                     is_mid_job_reset_pending = (batch_end % 50 == 0) and (batch_end < pages)
                     
@@ -624,9 +619,8 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
                 if (i + 1) % batch_size == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
-                    time.sleep(0.2)  # let Chrome breathe
+                    time.sleep(0.2)
                     
-                    # Mid-job reset every 50 pages
                     if (i + 1) % 50 == 0 and (i + 1) < pages:
                         if progress_cb:
                             progress_cb(f"♻️ Refreshing engine at page <b>{i+1}</b>...")
@@ -660,6 +654,15 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 # ==============================================================
 # QUEUE
 # ==============================================================
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    if secs == 0:
+        return f"{mins}m"
+    return f"{mins}m {secs}s"
 
 class Job:
     def __init__(self, chat_id, user_id, url, status_msg_id, reply_to_id, user_name):
@@ -728,15 +731,6 @@ class QueueManager:
                     pass
 
 queue = QueueManager()
-
-def format_duration(seconds):
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    if secs == 0:
-        return f"{mins}m"
-    return f"{mins}m {secs}s"
 
 # ==============================================================
 # UPLOAD HELPER
