@@ -2,8 +2,6 @@
 """
 Khan's Scribd Downloader — Telegram bot.
 Production-grade, queue-based, cache-aware, zero-leak.
-
-Runs on Render / any Docker host with Chromium installed.
 """
 
 import os
@@ -33,6 +31,7 @@ import telebot
 # ==============================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID  = os.environ.get("ADMIN_ID", "").strip()
 PORT      = int(os.environ.get("PORT", 8080))
 
 CHROME_BIN        = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
@@ -47,7 +46,7 @@ EXPORT_BATCH_SIZE = 4
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
-SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- edit this
+SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
 
 # ==============================================================
 # TELEGRAM
@@ -56,7 +55,7 @@ SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- edit this
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ==============================================================
-# HEALTH CHECK SERVER (Render keeps service alive)
+# HEALTH CHECK SERVER
 # ==============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -106,22 +105,17 @@ class Database:
             """)
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_users', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_jobs', 0)")
+            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_goal', 7)")
+            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_raised', 0)")
 
     def register_user(self, user_id, username, first_name):
-        """Returns True if this is a new user."""
         with self.lock:
             with self._conn() as c:
                 row = c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 if row:
-                    c.execute(
-                        "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                        (username, first_name, user_id),
-                    )
+                    c.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
                     return False
-                c.execute(
-                    "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-                    (user_id, username, first_name),
-                )
+                c.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
                 c.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_users'")
                 return True
 
@@ -133,10 +127,7 @@ class Database:
     def increment_user_downloads(self, user_id):
         with self.lock:
             with self._conn() as c:
-                c.execute(
-                    "UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?",
-                    (user_id,),
-                )
+                c.execute("UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?", (user_id,))
 
     def get_stats(self):
         with self.lock:
@@ -151,10 +142,22 @@ class Database:
                 row = c.execute("SELECT total_downloads FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 return row["total_downloads"] if row else 0
 
+    def get_donations(self):
+        with self.lock:
+            with self._conn() as c:
+                goal = c.execute("SELECT value FROM stats WHERE key = 'donation_goal'").fetchone()
+                raised = c.execute("SELECT value FROM stats WHERE key = 'donation_raised'").fetchone()
+                return (goal["value"] if goal else 7), (raised["value"] if raised else 0)
+
+    def set_donation(self, key, value):
+        with self.lock:
+            with self._conn() as c:
+                c.execute("UPDATE stats SET value = ? WHERE key = ?", (value, key))
+
 db = Database(DB_PATH)
 
 # ==============================================================
-# PERSISTENT BROWSER
+# BROWSER
 # ==============================================================
 
 class BrowserManager:
@@ -178,27 +181,34 @@ class BrowserManager:
 
     def _launch(self):
         os.makedirs(PROFILE_DIR, exist_ok=True)
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--remote-debugging-port=9222")
-        opts.add_argument("--window-size=1400,2000")
-        opts.add_argument("--disable-software-rasterizer")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument("--ignore-certificate-errors")
-        opts.add_argument("--force-color-profile=srgb")
-        opts.add_argument("--hide-scrollbars")
-        opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.binary_location = CHROME_BIN
+        for attempt in range(3):
+            try:
+                opts = Options()
+                opts.add_argument("--headless=new")
+                opts.add_argument("--no-sandbox")
+                opts.add_argument("--disable-dev-shm-usage")
+                opts.add_argument("--disable-gpu")
+                opts.add_argument("--window-size=1400,2000")
+                opts.add_argument("--disable-software-rasterizer")
+                opts.add_argument("--disable-blink-features=AutomationControlled")
+                opts.add_argument("--ignore-certificate-errors")
+                opts.add_argument("--force-color-profile=srgb")
+                opts.add_argument("--hide-scrollbars")
+                opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
+                opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+                opts.add_experimental_option("useAutomationExtension", False)
+                opts.binary_location = CHROME_BIN
 
-        service = Service(executable_path=CHROMEDRIVER_PATH)
-        self.driver = webdriver.Chrome(service=service, options=opts)
-        self.jobs_since_reset = 0
-        print("[browser] Chrome launched")
+                service = Service(executable_path=CHROMEDRIVER_PATH)
+                self.driver = webdriver.Chrome(service=service, options=opts)
+                self.jobs_since_reset = 0
+                print("[browser] Chrome launched successfully")
+                return
+            except Exception as e:
+                print(f"[browser] Launch failed (attempt {attempt+1}): {e}")
+                self._kill()
+                time.sleep(2)
+        raise RuntimeError("Chrome failed to launch after 3 attempts")
 
     def reset_between_jobs(self):
         if self.driver is None:
@@ -236,7 +246,9 @@ def cache_path(doc_id):
 
 def cache_lookup(doc_id):
     p = cache_path(doc_id)
-    return p if os.path.exists(p) and os.path.getsize(p) > 1024 else None
+    if os.path.exists(p) and os.path.getsize(p) > 1024:
+        return p
+    return None
 
 def cache_store(doc_id, src_path):
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -322,7 +334,7 @@ def load_page_batch(driver, nums, timeout=120):
             }
         }, 50);
     """, list(nums), timeout * 1000)
-    if not result.get("supported"):
+    if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
 
 def release_batch(driver, nums):
@@ -429,8 +441,7 @@ def export_page_to_pdf(driver, index, page_count):
     return base64.b64decode(result["data"])
 
 def fetch_scribd_pdf(url, output_path, progress_cb=None):
-    doc_id = extract_doc_id(url)
-    embed  = embed_url_for(url)
+    embed = embed_url_for(url)
     driver = browser.get()
 
     try:
@@ -487,8 +498,11 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
         finally:
             spool.cleanup()
     finally:
-        browser.reset_between_jobs()
-        browser.maybe_restart()
+        try:
+            browser.reset_between_jobs()
+            browser.maybe_restart()
+        except Exception as ex:
+            print(f"[browser restart error] {ex}")
 
     return pages
 
@@ -512,7 +526,6 @@ class QueueManager:
         self.lock    = threading.Lock()
 
     def add(self, job):
-        """Returns 0 if started immediately, else position in queue (1-based)."""
         with self.lock:
             if self.active is None:
                 self.active = job
@@ -535,12 +548,10 @@ class QueueManager:
                     self.active = next_job
                     threading.Thread(target=self._run, args=(next_job,), daemon=True).start()
 
-                # Notify remaining
                 remaining = list(self.pending)
                 next_id   = next_job.status_msg_id if next_job else None
                 chat_nex  = next_job.chat_id if next_job else None
 
-            # Updates outside the lock
             if next_job:
                 try:
                     bot.edit_message_text(
@@ -590,25 +601,30 @@ def process_job(job):
         # Cache hit?
         cached = cache_lookup(doc_id)
         if cached:
-            edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
-            with open(cached, "rb") as f:
-                bot.send_document(
-                    chat_id, f,
-                    caption=(
-                        f"✅ <b>Delivered from cache</b>\n\n"
-                        f"⚡ Fetched in under a second.\n\n"
-                        f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>"
-                    ),
-                    reply_to_message_id=job.reply_to_id,
-                    parse_mode="HTML",
-                    timeout=300,
-                    read_timeout=300,
-                )
-            db.increment_jobs()
-            db.increment_user_downloads(job.user_id)
-            try: bot.delete_message(chat_id, msg_id)
-            except Exception: pass
-            return
+            try:
+                edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
+                with open(cached, "rb") as f:
+                    bot.send_document(
+                        chat_id, f,
+                        caption=(
+                            f"✅ <b>Delivered from cache</b>\n\n"
+                            f"⚡ Fetched in under a second.\n\n"
+                            f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>"
+                        ),
+                        reply_to_message_id=job.reply_to_id,
+                        parse_mode="HTML",
+                        timeout=300,
+                        read_timeout=300,
+                    )
+                db.increment_jobs()
+                db.increment_user_downloads(job.user_id)
+                try: bot.delete_message(chat_id, msg_id)
+                except Exception: pass
+                return
+            except Exception as e:
+                print(f"[cache error] {e}")
+                try: os.remove(cached)
+                except Exception: pass
 
         # Fresh download
         edit("🚀 <b>Starting now...</b>\n\n⚙️ Booting engine...")
@@ -618,6 +634,9 @@ def process_job(job):
             output_pdf = os.path.join(workdir, f"scribd_{doc_id}.pdf")
             pages = fetch_scribd_pdf(job.url, output_pdf, progress_cb=edit)
 
+            if not os.path.exists(output_pdf):
+                raise RuntimeError("PDF generation failed")
+
             size = os.path.getsize(output_pdf)
             if size > MAX_TG_UPLOAD:
                 edit(
@@ -626,7 +645,6 @@ def process_job(job):
                 )
                 return
 
-            # Save to cache (best-effort)
             try:
                 cache_store(doc_id, output_pdf)
             except Exception:
@@ -663,10 +681,14 @@ def process_job(job):
 
     except Exception as e:
         err = str(e).lower()
-        if "invalid" in err or "no printable" in err:
+        if "invalid" in err or "no printable" in err or "could not find" in err:
             friendly = "❌ <b>Couldn't fetch that document.</b>\n\nIt may be private, region-locked, or Scribd is blocking us right now. Try again in a minute."
         elif "too large" in err:
             friendly = "❌ <b>File too large for Telegram.</b>"
+        elif "timeout" in err or "connection" in err:
+            friendly = "⏳ <b>Network timeout.</b>\n\nTelegram took too long to respond. Please try again."
+        elif "devtools" in err or "chrome" in err or "launch" in err:
+            friendly = "⚙️ <b>Browser engine crashed.</b>\n\nI'm restarting it. Try again in 10 seconds."
         else:
             friendly = "❌ <b>Something went wrong.</b>\n\nPlease try again in a moment."
         edit(friendly)
@@ -681,10 +703,29 @@ def process_job(job):
 def cmd_start(message):
     u = message.from_user
     name = html.escape(u.first_name or "friend")
-    username = u.username or ""
-    is_new = db.register_user(u.id, username, u.first_name or "")
+    is_new = db.register_user(u.id, u.username or "", u.first_name or "")
     jobs, users = db.get_stats()
     my_downloads = db.get_user_downloads(u.id)
+    goal, raised = db.get_donations()
+    percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
+
+    stats_block = (
+        f"🔢 <b>Global Stats</b>\n"
+        f"👥 Users served: <code>{users:,}</code>\n"
+        f"✅ Documents delivered: <code>{jobs:,}</code>\n\n"
+        f"💰 <b>Server Cost</b>\n"
+        f"🎯 Goal: <code>${goal}</code>\n"
+        f"💵 Raised: <code>${raised}</code>\n"
+        f"📊 Progress: <code>{percent}%</code>\n"
+    )
+
+    help_block = (
+        "📖 <b>How to use</b>\n"
+        "1️⃣ Copy a Scribd link\n"
+        "2️⃣ Paste it here\n"
+        "3️⃣ Get your PDF!\n\n"
+        "☕ /support — keep the server running"
+    )
 
     if is_new:
         text = (
@@ -692,23 +733,48 @@ def cmd_start(message):
             f"Hey <b>{name}</b>, I turn Scribd links into beautiful PDFs in seconds.\n\n"
             f"🚫 <b>100% Free.</b> No ads. No redirects. No spam.\n"
             f"🛠 Hosted personally by the Dev.\n\n"
-            f"🔢 <b>Live Global Stats:</b>\n"
-            f"👥 Users served: <code>{users:,}</code>\n"
-            f"✅ Documents delivered: <code>{jobs:,}</code>\n\n"
-            f"📥 <i>Send me any Scribd link to begin.</i>\n"
-            f"❓ /help for more info"
+            f"{stats_block}\n"
+            f"{help_block}"
         )
     else:
         text = (
             f"👋 <b>Welcome back, {name}!</b>\n\n"
-            f"🔢 <b>Live Global Stats:</b>\n"
-            f"👥 Users served: <code>{users:,}</code>\n"
-            f"✅ Documents delivered: <code>{jobs:,}</code>\n"
             f"📊 Your downloads: <code>{my_downloads:,}</code>\n\n"
-            f"📥 <i>Drop a Scribd link below to download.</i>"
+            f"{stats_block}\n"
+            f"{help_block}"
         )
 
     bot.reply_to(message, text, parse_mode="HTML")
+
+@bot.message_handler(commands=["setgoal"])
+def cmd_setgoal(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /setgoal 10")
+        return
+    try:
+        amount = int(parts[1])
+        db.set_donation("donation_goal", amount)
+        bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "Usage: /setgoal 10")
+
+@bot.message_handler(commands=["setdonation"])
+def cmd_setdonation(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /setdonation 5")
+        return
+    try:
+        amount = int(parts[1])
+        db.set_donation("donation_raised", amount)
+        bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
+    except Exception:
+        bot.reply_to(message, "Usage: /setdonation 5")
 
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
@@ -733,11 +799,15 @@ def cmd_help(message):
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
     jobs, users = db.get_stats()
+    goal, raised = db.get_donations()
+    percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
     bot.reply_to(
         message,
         f"🔢 <b>Live Stats</b>\n\n"
         f"👥 Users: <code>{users:,}</code>\n"
-        f"✅ Documents delivered: <code>{jobs:,}</code>",
+        f"✅ Documents delivered: <code>{jobs:,}</code>\n\n"
+        f"💰 Server Cost\n"
+        f"🎯 Goal: <code>${goal}</code> | 💵 Raised: <code>${raised}</code> ({percent}%)",
         parse_mode="HTML",
     )
 
@@ -772,7 +842,6 @@ def cmd_text(message):
     u = message.from_user
     db.register_user(u.id, u.username or "", u.first_name or "")
 
-    # Immediate feedback
     try:
         status = bot.reply_to(message, "⏳ <b>Received!</b>\n\nChecking queue...", parse_mode="HTML")
     except Exception:
@@ -790,9 +859,8 @@ def cmd_text(message):
     pos = queue.add(job)
 
     if pos == 0:
-        return  # Job is already running; process_job handles its own edits
+        return
 
-    # In queue
     try:
         bot.edit_message_text(
             f"⏳ <b>You're in line!</b>\n\n"
@@ -818,11 +886,9 @@ def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    # Background: health check
     threading.Thread(target=start_health_server, daemon=True).start()
     print(f"[health] listening on :{PORT}")
 
-    # Background: warm up Chrome
     def warm():
         try:
             browser.get()
