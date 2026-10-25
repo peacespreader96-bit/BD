@@ -50,7 +50,7 @@ JOBS_BEFORE_CHROME_RESET = 30
 
 MAX_JOB_SECONDS   = 900  # 15 minutes hard cap
 MAX_CACHE_BYTES   = 400 * 1024 * 1024
-LAST_JOB_DURATION = 30.0 # Tracks previous job speed for dynamic queue estimates
+LAST_JOB_DURATION = 30.0 
 
 SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
 
@@ -134,6 +134,7 @@ class Database:
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_jobs', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_goal', 7)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_raised', 0)")
+            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('max_pages_limit', 80)") # Default limit
 
     def register_user(self, user_id, username, first_name):
         with self.lock:
@@ -176,10 +177,16 @@ class Database:
                 raised = c.execute("SELECT value FROM stats WHERE key = 'donation_raised'").fetchone()
                 return (goal["value"] if goal else 7), (raised["value"] if raised else 0)
 
-    def set_donation(self, key, value):
+    def set_stat(self, key, value):
         with self.lock:
             with self._conn() as c:
                 c.execute("UPDATE stats SET value = ? WHERE key = ?", (value, key))
+
+    def get_stat(self, key, default=0):
+        with self.lock:
+            with self._conn() as c:
+                row = c.execute("SELECT value FROM stats WHERE key = ?", (key,)).fetchone()
+                return row["value"] if row else default
 
 db = Database(DB_PATH)
 
@@ -449,6 +456,12 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
         hide_cookies(driver)
         pages = wait_for_pages(driver, 60)
         if pages <= 0: raise RuntimeError("No printable pages detected")
+        
+        # --- PAGE LIMIT CHECK ---
+        current_limit = db.get_stat("max_pages_limit", 80)
+        if pages > current_limit:
+            raise RuntimeError(f"too_many_pages:{pages}:{current_limit}")
+
         if progress_cb: progress_cb(f"📄 Detected <b>{pages}</b> pages. Preparing...")
 
         prepare_for_print(driver)
@@ -484,17 +497,14 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
             if progress_cb: progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
             logger.info(f"Stitching {len(files)} pages into PDF...")
             
-            # THE STITCHING FIX
             writer = PdfWriter()
             try:
                 for p in files:
-                    # Skip corrupt/empty files
                     if os.path.getsize(p) < 1000:
                         logger.warning(f"Skipping empty/corrupt page file: {p}")
                         continue
                     try:
                         writer.append(p)
-                        # Delete file immediately after merging to save RAM/Disk
                         try: os.remove(p)
                         except: pass
                     except Exception as e:
@@ -707,6 +717,9 @@ def process_job(job):
         err = str(e).lower()
         if timeout_occurred:
             friendly = "❌ <b>Job timed out.</b>\n\nThis document is too large or Scribd is being slow. Please try a smaller document."
+        elif "too_many_pages" in err:
+            _, pages, limit = str(e).split(":")
+            friendly = f"❌ <b>Document too large</b>\n\nThis document has <b>{pages}</b> pages, but the current limit is <b>{limit}</b> pages to prevent server overload.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a> to raise the limit!"
         elif "invalid" in err or "no printable" in err or "could not find" in err:
             friendly = "❌ <b>Couldn't fetch that document.</b>\n\nIt may be private, region-locked, or Scribd is blocking us right now. Try again in a minute."
         elif "too large" in err:
@@ -744,6 +757,36 @@ def cmd_cancel(message):
         bot.reply_to(message, "✅ <b>Removed from queue.</b>", parse_mode="HTML")
     else:
         bot.reply_to(message, "ℹ️ You're not in the queue.", parse_mode="HTML")
+
+@bot.message_handler(commands=["setgoal"])
+def cmd_setgoal(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    parts = message.text.split()
+    if len(parts) < 2: return bot.reply_to(message, "Usage: /setgoal 10")
+    try:
+        amount = int(parts[1]); db.set_stat("donation_goal", amount)
+        bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
+    except: bot.reply_to(message, "Usage: /setgoal 10")
+
+@bot.message_handler(commands=["setdonation"])
+def cmd_setdonation(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    parts = message.text.split()
+    if len(parts) < 2: return bot.reply_to(message, "Usage: /setdonation 5")
+    try:
+        amount = int(parts[1]); db.set_stat("donation_raised", amount)
+        bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
+    except: bot.reply_to(message, "Usage: /setdonation 5")
+
+@bot.message_handler(commands=["setlimit"])
+def cmd_setlimit(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    parts = message.text.split()
+    if len(parts) < 2: return bot.reply_to(message, "Usage: /setlimit 80")
+    try:
+        amount = int(parts[1]); db.set_stat("max_pages_limit", amount)
+        bot.reply_to(message, f"✅ Max page limit updated to <b>{amount}</b>.", parse_mode="HTML")
+    except: bot.reply_to(message, "Usage: /setlimit 80")
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -787,26 +830,6 @@ def cmd_start(message):
         )
     bot.reply_to(message, text, parse_mode="HTML")
 
-@bot.message_handler(commands=["setgoal"])
-def cmd_setgoal(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setgoal 10")
-    try:
-        amount = int(parts[1]); db.set_donation("donation_goal", amount)
-        bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
-    except: bot.reply_to(message, "Usage: /setgoal 10")
-
-@bot.message_handler(commands=["setdonation"])
-def cmd_setdonation(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setdonation 5")
-    try:
-        amount = int(parts[1]); db.set_donation("donation_raised", amount)
-        bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
-    except: bot.reply_to(message, "Usage: /setdonation 5")
-
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     text = (
@@ -823,9 +846,10 @@ def cmd_help(message):
 def cmd_stats(message):
     jobs, users = db.get_stats(); goal, raised = db.get_donations()
     percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
+    limit = db.get_stat("max_pages_limit", 80)
     bot.reply_to(
         message,
-        f"🔢 <b>Live Stats</b>\n\n👥 Users: <code>{users:,}</code>\n✅ Documents delivered: <code>{jobs:,}</code>\n\n"
+        f"🔢 <b>Live Stats</b>\n\n👥 Users: <code>{users:,}</code>\n✅ Documents delivered: <code>{jobs:,}</code>\n📄 Max Pages: <code>{limit}</code>\n\n"
         f"💰 Server Cost\n🎯 Goal: <code>${goal}</code> | 💵 Raised: <code>${raised}</code> ({percent}%)",
         parse_mode="HTML",
     )
