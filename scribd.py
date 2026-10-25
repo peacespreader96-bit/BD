@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Khan's Scribd Downloader — Telegram bot.
-Production-grade, queue-based, cache-aware, memory-optimized.
+Production-grade, queue-based, cache-aware, MAX SPEED.
 """
 
 import os
@@ -43,7 +43,7 @@ CACHE_DIR         = "/app/cache"
 PROFILE_DIR       = "/app/chrome-profile"
 
 MAX_TG_UPLOAD     = 49 * 1024 * 1024
-EXPORT_BATCH_SIZE = 2          # Reduced from 4 to 2 — halves RAM spike
+EXPORT_BATCH_SIZE = 4          # Bumped back to 4 for double the speed
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
@@ -204,7 +204,19 @@ class BrowserManager:
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
-                opts.add_argument("--js-flags=--max-old-space-size=128")  # cap V8 heap
+                
+                # --- SPEED FLAGS ADDED HERE ---
+                opts.add_argument("--js-flags=--max-old-space-size=128")
+                opts.add_argument("--disable-extensions")
+                opts.add_argument("--disable-background-networking")
+                opts.add_argument("--disable-default-apps")
+                opts.add_argument("--disable-sync")
+                opts.add_argument("--metrics-recording-only")
+                opts.add_argument("--mute-audio")
+                opts.add_argument("--no-first-run")
+                opts.add_argument("--safebrowsing-disable-auto-update")
+                opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
+                
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option("useAutomationExtension", False)
@@ -361,7 +373,7 @@ def release_batch(driver, nums):
         driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
     except Exception:
         pass
-    gc.collect()  # Force Python GC after every batch
+    gc.collect()
 
 def hide_cookies(driver):
     driver.execute_script("""
@@ -458,7 +470,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
     try:
         driver.get(embed)
-        time.sleep(1)
+        # REMOVED time.sleep(1) - wait_for_pages handles the wait perfectly
         hide_cookies(driver)
 
         pages = wait_for_pages(driver, 60)
@@ -489,8 +501,6 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                 with open(p, "wb") as f:
                     f.write(pdf_bytes)
                 files.append(p)
-
-                # Free the raw bytes immediately
                 del pdf_bytes
 
                 if progress_cb and (i + 1) % 5 == 0:
@@ -589,7 +599,7 @@ class QueueManager:
                         message_id=wj.status_msg_id,
                         parse_mode="HTML",
                     )
-                    time.sleep(0.05)
+                    time.sleep(0.02) # Sped up from 0.05
                 except Exception:
                     pass
 
@@ -637,7 +647,6 @@ def process_job(job):
     try:
         doc_id = extract_doc_id(job.url)
 
-        # Cache hit?
         cached = cache_lookup(doc_id)
         if cached:
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
@@ -659,7 +668,6 @@ def process_job(job):
                 try: os.remove(cached)
                 except Exception: pass
 
-        # Fresh download
         edit("🚀 <b>Starting now...</b>\n\n⚙️ Booting engine...")
 
         workdir = tempfile.mkdtemp(prefix="scribd-job-")
