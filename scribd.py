@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Khan's Scribd Downloader — Telegram bot.
+Heart Over Money | PDF Bot
 Production-grade, queue-based, cache-aware, MAX SPEED, Loggable.
 """
 
@@ -64,7 +64,7 @@ class MemoryLogHandler(logging.Handler):
     def emit(self, record):
         log_buffer.append(self.format(record))
 
-logger = logging.getLogger("scribd")
+logger = logging.getLogger("heart_over_money")
 logger.setLevel(logging.INFO)
 
 console_handler = logging.StreamHandler(sys.stdout)
@@ -134,7 +134,7 @@ class Database:
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_jobs', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_goal', 7)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_raised', 0)")
-            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('max_pages_limit', 80)") # Default limit
+            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('max_pages_limit', 80)")
 
     def register_user(self, user_id, username, first_name):
         with self.lock:
@@ -187,6 +187,12 @@ class Database:
             with self._conn() as c:
                 row = c.execute("SELECT value FROM stats WHERE key = ?", (key,)).fetchone()
                 return row["value"] if row else default
+
+    def get_all_user_ids(self):
+        with self.lock:
+            with self._conn() as c:
+                rows = c.execute("SELECT user_id FROM users").fetchall()
+                return [row["user_id"] for row in rows]
 
 db = Database(DB_PATH)
 
@@ -457,7 +463,6 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
         pages = wait_for_pages(driver, 60)
         if pages <= 0: raise RuntimeError("No printable pages detected")
         
-        # --- PAGE LIMIT CHECK ---
         current_limit = db.get_stat("max_pages_limit", 80)
         if pages > current_limit:
             raise RuntimeError(f"too_many_pages:{pages}:{current_limit}")
@@ -788,6 +793,49 @@ def cmd_setlimit(message):
         bot.reply_to(message, f"✅ Max page limit updated to <b>{amount}</b>.", parse_mode="HTML")
     except: bot.reply_to(message, "Usage: /setlimit 80")
 
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    
+    # Check if it's a reply or a direct command
+    if message.reply_to_message:
+        msg_to_send = message.reply_to_message
+    elif len(message.text.split(None, 1)) > 1:
+        msg_to_send = message.text.split(None, 1)[1]
+    else:
+        bot.reply_to(message, "Usage: Reply to any message with `/broadcast` OR type `/broadcast <text>` to broadcast a text message.", parse_mode="HTML")
+        return
+
+    status_msg = bot.reply_to(message, "⏳ <b>Starting broadcast...</b>", parse_mode="HTML")
+
+    def run_broadcast():
+        users = db.get_all_user_ids()
+        success = 0
+        blocked = 0
+        
+        for uid in users:
+            try:
+                if isinstance(msg_to_send, str):
+                    bot.send_message(uid, msg_to_send, parse_mode="HTML")
+                else:
+                    bot.copy_message(chat_id=uid, from_chat_id=msg_to_send.chat.id, message_id=msg_to_send.message_id)
+                success += 1
+            except Exception:
+                blocked += 1
+            time.sleep(0.05) # Prevent Telegram rate limits
+            
+        bot.edit_message_text(
+            f"✅ <b>Broadcast Finished</b>\n\n"
+            f"👥 Total Users: <code>{len(users)}</code>\n"
+            f"🟢 Delivered: <code>{success}</code>\n"
+            f"🔴 Blocked/Error: <code>{blocked}</code>",
+            chat_id=status_msg.chat.id, 
+            message_id=status_msg.message_id, 
+            parse_mode="HTML"
+        )
+        
+    threading.Thread(target=run_broadcast, daemon=True).start()
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     u = message.from_user
@@ -816,7 +864,7 @@ def cmd_start(message):
 
     if is_new:
         text = (
-            f"⚡ <b>Welcome to Khan's Scribd Downloader!</b>\n\n"
+            f"⚡ <b>Welcome to Heart Over Money!</b>\n\n"
             f"Hey <b>{name}</b>, I turn Scribd links into beautiful PDFs in seconds.\n\n"
             f"🚫 <b>100% Free.</b> No ads. No redirects. No spam.\n"
             f"🛠 Hosted personally by the Dev.\n\n"
@@ -833,7 +881,7 @@ def cmd_start(message):
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     text = (
-        "📖 <b>How to use Khan's Scribd Downloader</b>\n\n"
+        "📖 <b>How to use Heart Over Money</b>\n\n"
         "1️⃣ Open Scribd in your browser\n2️⃣ Copy the link\n3️⃣ Paste it here\n\n"
         "I'll fetch the full PDF and send it back to you.\n\n"
         "🔗 <b>Supported formats:</b>\n<code>https://www.scribd.com/document/…</code>\n<code>https://www.scribd.com/doc/…</code>\n\n"
@@ -858,7 +906,7 @@ def cmd_stats(message):
 def cmd_support(message):
     text = (
         "☕ <b>Support the Dev</b>\n\n"
-        "Khan's Scribd Downloader is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
+        "Heart Over Money is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
         "Server costs come straight out of my pocket.\nIf this bot saves you time, you can buy me a coffee:\n\n"
         f"☕ <a href='{SUPPORT_URL}'>Buy Me a Coffee</a>\n\n"
         "Or just share the bot with a friend — that helps too. 💙"
@@ -923,7 +971,7 @@ def main():
     threading.Thread(target=warm, daemon=True).start()
 
     jobs, users = db.get_stats()
-    logger.info("📚 Khan's Scribd Downloader online")
+    logger.info("📚 Heart Over Money PDF Bot online")
     logger.info(f"   Total jobs delivered: {jobs:,}")
     logger.info(f"   Total users served:   {users:,}")
 
