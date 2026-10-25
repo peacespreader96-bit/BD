@@ -52,9 +52,6 @@ MAX_JOB_SECONDS   = 900  # 15 minutes hard cap
 MAX_CACHE_BYTES   = 400 * 1024 * 1024
 LAST_JOB_DURATION = 30.0 
 
-# TELEGRAM STARS CONFIG
-STARS_AMOUNT      = 50 # Amount of stars to request
-
 # ==============================================================
 # LOGGING SETUP
 # ==============================================================
@@ -126,11 +123,10 @@ class Database:
                     total_stars INTEGER DEFAULT 0
                 )
             """)
-            # Safe migration for existing DBs
             try:
                 c.execute("ALTER TABLE users ADD COLUMN total_stars INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
-                pass # Column already exists
+                pass
                 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS stats (
@@ -140,8 +136,6 @@ class Database:
             """)
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_users', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_jobs', 0)")
-            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_goal', 7)")
-            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_raised', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('max_pages_limit', 80)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_stars', 0)")
 
@@ -760,25 +754,36 @@ def cmd_support(message):
         "⭐ <b>Support the Dev with Telegram Stars</b>\n\n"
         "Heart Over Money is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
         "Server costs come straight out of my pocket.\nIf this bot saves you time, you can send me Stars directly here on Telegram!\n\n"
-        f"👇 Tap the button below to send <b>{STARS_AMOUNT} Stars</b>."
+        "👇 <b>Choose how many Stars you'd like to send:</b>"
     )
     
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.add(telebot.types.InlineKeyboardButton(f"Send {STARS_AMOUNT} ⭐", callback_data="send_stars"))
+    row1 = [
+        telebot.types.InlineKeyboardButton("15 ⭐", callback_data="stars_15"),
+        telebot.types.InlineKeyboardButton("50 ⭐", callback_data="stars_50")
+    ]
+    row2 = [
+        telebot.types.InlineKeyboardButton("100 ⭐", callback_data="stars_100"),
+        telebot.types.InlineKeyboardButton("500 ⭐", callback_data="stars_500")
+    ]
+    markup.row(*row1)
+    markup.row(*row2)
     bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data == "send_stars")
+@bot.callback_query_handler(func=lambda call: call.data.startswith("stars_"))
 def callback_send_stars(call):
     try:
         bot.answer_callback_query(call.id)
+        amount = int(call.data.split("_")[1])
+        
         bot.send_invoice(
             chat_id=call.message.chat.id,
-            title="Support Heart Over Money ⭐",
-            description="Send Telegram Stars to keep the servers running and the PDFs flowing!",
+            title=f"Support Heart Over Money ⭐",
+            description=f"Send {amount} Telegram Stars to keep the servers running and the PDFs flowing!",
             invoice_payload="support_donation",
-            provider_token="", # MUST be empty for Stars
-            currency="XTR",    # Telegram Stars currency code
-            prices=[telebot.types.LabeledPrice(label="Support", amount=STARS_AMOUNT)],
+            provider_token="", 
+            currency="XTR",    
+            prices=[telebot.types.LabeledPrice(label=f"Support ({amount} Stars)", amount=amount)],
             start_parameter="support-stars"
         )
     except Exception as e:
