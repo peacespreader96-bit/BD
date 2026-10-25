@@ -190,6 +190,7 @@ class BrowserManager:
                 opts.add_argument("--disable-dev-shm-usage")
                 opts.add_argument("--disable-gpu")
                 opts.add_argument("--window-size=1400,2000")
+                opts.add_argument("--disable-software-rasterizer")
                 opts.add_argument("--disable-blink-features=AutomationControlled")
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
@@ -218,7 +219,6 @@ class BrowserManager:
                 opts.add_experimental_option("useAutomationExtension", False)
                 opts.binary_location = CHROME_BIN
 
-                # Return as soon as DOM is ready, we handle waits manually
                 opts.page_load_strategy = "eager"
 
                 service = Service(executable_path=CHROMEDRIVER_PATH)
@@ -301,33 +301,24 @@ def configure_timeout(driver, seconds):
     except Exception:
         pass
 
-def wait_for_pages(driver, timeout=30):
-    """MutationObserver fires the instant DOM updates — no polling throttle."""
+def wait_for_pages(driver, timeout=60):
+    """REVERTED: Back to the reliable polling loop."""
     driver.set_script_timeout(timeout + 5)
     return int(driver.execute_async_script("""
         const budget = arguments[0];
         const done   = arguments[arguments.length - 1];
         const start  = performance.now();
-
-        const initial = document.querySelectorAll('.outer_page').length;
-        if (initial > 0) { done(initial); return; }
-
-        const observer = new MutationObserver(() => {
+        function tick() {
             const n = document.querySelectorAll('.outer_page').length;
-            if (n > 0) {
-                observer.disconnect();
-                done(n);
-            }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-
-        setTimeout(() => {
-            observer.disconnect();
-            done(document.querySelectorAll('.outer_page').length);
-        }, budget);
+            if (n > 0) { done(n); return; }
+            if (performance.now() - start >= budget) { done(0); return; }
+            setTimeout(tick, 250);
+        }
+        tick();
     """, timeout * 1000) or 0)
 
 def load_page_batch(driver, nums, timeout=120):
+    """REVERTED: Back to the reliable setInterval loop."""
     configure_timeout(driver, timeout + 10)
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
@@ -336,45 +327,36 @@ def load_page_batch(driver, nums, timeout=120):
         const done      = arguments[arguments.length - 1];
         const mgr       = window.docManager;
         if (!mgr || !mgr.pages) { done({supported: false}); return; }
-
-        async function processPage(n) {
-            const p = mgr.pages[n];
-            if (!p) return { pageNum: n, error: 'missing' };
-            try {
-                if (!p.innerPageElem) p.load();
-                if (!p.innerPageElem) {
-                    await new Promise(resolve => {
-                        const check = setInterval(() => {
-                            if (p.innerPageElem) { clearInterval(check); resolve(); }
-                        }, 50);
-                        setTimeout(() => { clearInterval(check); resolve(); }, timeoutMs);
-                    });
-                }
-                if (!p.innerPageElem) return { pageNum: n, error: 'timeout' };
-
-                p.display();
-                if (!p._imagesTurnedOn) p.turnOnImages();
-
-                const imgs = Array.from(p.innerPageElem.querySelectorAll('img'));
-                // Event-driven image wait instead of polling
-                await Promise.all(imgs.map(img => {
-                    if (img.complete) return Promise.resolve();
-                    return new Promise(resolve => {
-                        img.addEventListener('load', resolve);
-                        img.addEventListener('error', resolve);
-                        setTimeout(resolve, 5000); // 5s max per image
-                    });
-                }));
-                return { pageNum: n, error: null };
-            } catch (e) {
-                return { pageNum: n, error: String(e) };
-            }
+        const states = nums.map(n => ({ pageNum: n, page: mgr.pages[n], error: null }));
+        const start  = Date.now();
+        for (const s of states) {
+            if (!s.page) { s.error = 'missing'; continue; }
+            try { if (!s.page.innerPageElem) s.page.load(); }
+            catch (e) { s.error = String(e); }
         }
-
-        Promise.all(nums.map(processPage)).then(results => {
-            const failed = results.filter(r => r.error);
-            done({ supported: true, failed });
-        });
+        const timer = setInterval(() => {
+            let ready = 0;
+            for (const s of states) {
+                if (s.error) { ready++; continue; }
+                const p = s.page;
+                if (!p.innerPageElem) continue;
+                try {
+                    p.display();
+                    if (!p._imagesTurnedOn) p.turnOnImages();
+                } catch (e) { s.error = String(e); ready++; continue; }
+                const imgs = Array.from(p.innerPageElem.querySelectorAll('img'));
+                if (imgs.every(i => i.complete)) ready++;
+            }
+            if (ready === states.length) {
+                clearInterval(timer);
+                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error}))});
+                return;
+            }
+            if (Date.now() - start >= timeoutMs) {
+                clearInterval(timer);
+                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
+            }
+        }, 50);
     """, list(nums), timeout * 1000)
     if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
@@ -401,8 +383,6 @@ def hide_cookies(driver):
     """)
 
 def prepare_for_print(driver):
-    # Set media type once, not 65 times
-    driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
     driver.execute_script("""
         const top = document.querySelector('.toolbar_top');    if (top) top.remove();
         const bot = document.querySelector('.toolbar_bottom'); if (bot) bot.remove();
@@ -414,21 +394,36 @@ def prepare_for_print(driver):
             el.style.margin    = '0';
             el.style.padding   = '0';
         });
-        
+    """)
+
+def export_page_to_pdf(driver, index, page_count):
+    """REVERTED: Back to direct style injection and ReturnAsBase64."""
+    info = driver.execute_script("""
+        const i = arguments[0];
+        const pages = Array.from(document.querySelectorAll('.outer_page'));
+        const target = pages[i];
+        if (!target) return null;
         const old = document.getElementById('isolated-print-css');
         if (old) old.remove();
-        
+        pages.forEach(p => {
+            ['display','visibility','position','top','left','right','bottom','margin',
+             'break-after','page-break-after','break-before','page-break-before']
+                .forEach(prop => p.style.removeProperty(prop));
+        });
+        const r = target.getBoundingClientRect();
+        const w = Math.ceil(r.width);
+        const h = Math.ceil(r.height);
+        pages.forEach(p => p.removeAttribute('data-export-target'));
+        target.setAttribute('data-export-target','true');
         const s = document.createElement('style');
         s.id = 'isolated-print-css';
-        // CSS variables are much faster to update per-page
         s.textContent = `
-            :root { --pdf-w: 800px; --pdf-h: 1100px; }
-            @page { size: var(--pdf-w) var(--pdf-h); margin: 0; }
+            @page { size: ${w}px ${h}px; margin: 0; }
             @media print {
                 html, body {
-                    width: var(--pdf-w) !important; height: var(--pdf-h) !important;
-                    min-width: var(--pdf-w) !important; min-height: var(--pdf-h) !important;
-                    max-width: var(--pdf-w) !important; max-height: var(--pdf-h) !important;
+                    width: ${w}px !important; height: ${h}px !important;
+                    min-width: ${w}px !important; min-height: ${h}px !important;
+                    max-width: ${w}px !important; max-height: ${h}px !important;
                     margin: 0 !important; padding: 0 !important;
                     overflow: hidden !important;
                     -webkit-print-color-adjust: exact !important;
@@ -439,42 +434,20 @@ def prepare_for_print(driver):
                     display: block !important; visibility: visible !important;
                     position: absolute !important;
                     top: 0 !important; left: 0 !important;
-                    width: var(--pdf-w) !important; height: var(--pdf-h) !important;
+                    width: ${w}px !important; height: ${h}px !important;
                     margin: 0 !important; padding: 0 !important;
                     overflow: hidden !important;
                 }
             }
         `;
         document.head.appendChild(s);
-    """)
-
-def export_page_to_pdf(driver, index, page_count):
-    info = driver.execute_script("""
-        const i = arguments[0];
-        const pages = document.querySelectorAll('.outer_page');
-        const target = pages[i];
-        if (!target) return null;
-
-        const r = target.getBoundingClientRect();
-        const w = Math.ceil(r.width);
-        const h = Math.ceil(r.height);
-
-        const old = document.querySelector('.outer_page[data-export-target="true"]');
-        if (old) old.removeAttribute('data-export-target');
-        
-        target.setAttribute('data-export-target','true');
-        document.documentElement.style.setProperty('--pdf-w', w + 'px');
-        document.documentElement.style.setProperty('--pdf-h', h + 'px');
-        
         return { width: w, height: h };
     """, index)
     if not info:
         raise RuntimeError(f"Page {index+1}/{page_count} missing")
-        
     w_in = int(info["width"]) / 96.0
     h_in = int(info["height"]) / 96.0
-    
-    # ReturnAsStream skips the heavy Base64 encoding process entirely
+    driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
     result = driver.execute_cdp_cmd("Page.printToPDF", {
         "landscape": False,
         "displayHeaderFooter": False,
@@ -485,25 +458,9 @@ def export_page_to_pdf(driver, index, page_count):
         "marginTop": 0, "marginBottom": 0, "marginLeft": 0, "marginRight": 0,
         "preferCSSPageSize": True,
         "pageRanges": "1",
-        "transferMode": "ReturnAsStream",
+        "transferMode": "ReturnAsBase64",
     })
-    
-    # Read binary stream directly
-    stream_handle = result["stream"]
-    pdf_bytes = b""
-    while True:
-        chunk = driver.execute_cdp_cmd("IO.read", {"handle": stream_handle, "size": 1024*1024})
-        data = chunk.get("data", "")
-        if data:
-            if chunk.get("base64Encoded"):
-                pdf_bytes += base64.b64decode(data)
-            else:
-                pdf_bytes += data.encode("utf-8")
-        if chunk.get("eof"):
-            break
-            
-    driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
-    return pdf_bytes
+    return base64.b64decode(result["data"])
 
 def fetch_scribd_pdf(url, output_path, progress_cb=None):
     embed = embed_url_for(url)
@@ -513,7 +470,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
         driver.get(embed)
         hide_cookies(driver)
 
-        pages = wait_for_pages(driver, 30)
+        pages = wait_for_pages(driver, 60)
         if pages <= 0:
             raise RuntimeError("No printable pages detected")
         if progress_cb:
@@ -521,6 +478,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
         prepare_for_print(driver)
         configure_timeout(driver, CDP_TIMEOUT)
+        driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
 
         spool = tempfile.TemporaryDirectory(prefix="scribd-pages-")
         files = []
@@ -546,11 +504,10 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                 if progress_cb and (i + 1) % 5 == 0:
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
 
-                # Only release pages from DOM — no slow GC per batch
                 if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
 
-            # ONE GC at the end of the job instead of 3x per batch
+            # ONE GC at the end of the job
             try:
                 driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
             except Exception:
