@@ -335,7 +335,7 @@ def wait_for_pages(driver, timeout=60):
         tick();
     """, timeout * 1000) or 0)
 
-def load_page_batch(driver, nums, timeout=45): # Reduced timeout so it fails fast and retries
+def load_page_batch(driver, nums, timeout=45):
     configure_timeout(driver, timeout + 10)
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
@@ -462,7 +462,6 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     batch = list(range(i + 1, batch_end + 1))
                     if progress_cb: progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
                     
-                    # Pure sequential loading, no pre-fetching lag
                     res = load_page_batch(driver, batch)
                     if res.get("failed"):
                         logger.warning(f"Some pages in batch failed: {res['failed']}")
@@ -483,13 +482,33 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     release_batch(driver, batch)
 
             if progress_cb: progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
-            logger.info(f"Stitching {len(files)} pages into PDF")
+            logger.info(f"Stitching {len(files)} pages into PDF...")
+            
+            # THE STITCHING FIX
             writer = PdfWriter()
             try:
-                for p in files: writer.append(p)
-                with open(output_path, "wb") as out: writer.write(out)
-            finally: writer.close()
-        finally: spool.cleanup()
+                for p in files:
+                    # Skip corrupt/empty files
+                    if os.path.getsize(p) < 1000:
+                        logger.warning(f"Skipping empty/corrupt page file: {p}")
+                        continue
+                    try:
+                        writer.append(p)
+                        # Delete file immediately after merging to save RAM/Disk
+                        try: os.remove(p)
+                        except: pass
+                    except Exception as e:
+                        logger.error(f"Failed to append {p}: {e}")
+                        
+                with open(output_path, "wb") as out: 
+                    writer.write(out)
+            finally: 
+                writer.close()
+                
+            logger.info("PDF stitching complete.")
+            
+        finally:
+            spool.cleanup()
     finally:
         try: browser.reset_between_jobs(); browser.maybe_restart()
         except Exception as ex: logger.error(f"[browser restart error] {ex}")
@@ -527,20 +546,17 @@ class QueueManager:
 
     def cancel(self, user_id):
         with self.lock:
-            # 1. Remove from pending
             before = len(self.pending)
             self.pending = deque(j for j in self.pending if j.user_id != user_id)
             removed_pending = before - len(self.pending)
             
-            # 2. Kill active job if it belongs to this user
             killed_active = False
             if self.active and self.active.user_id == user_id:
                 killed_active = True
                 logger.warning(f"[cancel] User {user_id} killed active job. Terminating Chrome.")
-                browser._kill() # This forces Selenium to throw an exception, breaking the hang
+                browser._kill()
                 self.active = None
                 
-                # Start next job since we killed this one
                 if self.pending:
                     next_job = self.pending.popleft()
                     self.active = next_job
@@ -555,7 +571,7 @@ class QueueManager:
             logger.error(f"Queue error: {traceback.format_exc()}")
         finally:
             with self.lock:
-                if self.active is job: # Check if we weren't manually killed
+                if self.active is job: 
                     self.active = None
                     next_job = None
                     if self.pending:
