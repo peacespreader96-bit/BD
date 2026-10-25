@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Khan's Scribd Downloader — Telegram bot.
-Production-grade, queue-based, cache-aware, zero-leak.
+Production-grade, queue-based, cache-aware, memory-optimized.
 """
 
 import os
 import re
+import gc
 import sys
 import time
 import html
@@ -42,7 +43,7 @@ CACHE_DIR         = "/app/cache"
 PROFILE_DIR       = "/app/chrome-profile"
 
 MAX_TG_UPLOAD     = 49 * 1024 * 1024
-EXPORT_BATCH_SIZE = 4
+EXPORT_BATCH_SIZE = 2          # Reduced from 4 to 2 — halves RAM spike
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
@@ -113,9 +114,15 @@ class Database:
             with self._conn() as c:
                 row = c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 if row:
-                    c.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
+                    c.execute(
+                        "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                        (username, first_name, user_id),
+                    )
                     return False
-                c.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
+                c.execute(
+                    "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+                    (user_id, username, first_name),
+                )
                 c.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_users'")
                 return True
 
@@ -127,7 +134,10 @@ class Database:
     def increment_user_downloads(self, user_id):
         with self.lock:
             with self._conn() as c:
-                c.execute("UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?", (user_id,))
+                c.execute(
+                    "UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
 
     def get_stats(self):
         with self.lock:
@@ -145,7 +155,7 @@ class Database:
     def get_donations(self):
         with self.lock:
             with self._conn() as c:
-                goal = c.execute("SELECT value FROM stats WHERE key = 'donation_goal'").fetchone()
+                goal   = c.execute("SELECT value FROM stats WHERE key = 'donation_goal'").fetchone()
                 raised = c.execute("SELECT value FROM stats WHERE key = 'donation_raised'").fetchone()
                 return (goal["value"] if goal else 7), (raised["value"] if raised else 0)
 
@@ -194,6 +204,7 @@ class BrowserManager:
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
+                opts.add_argument("--js-flags=--max-old-space-size=128")  # cap V8 heap
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option("useAutomationExtension", False)
@@ -350,6 +361,7 @@ def release_batch(driver, nums):
         driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
     except Exception:
         pass
+    gc.collect()  # Force Python GC after every batch
 
 def hide_cookies(driver):
     driver.execute_script("""
@@ -464,7 +476,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
             for i in range(pages):
                 if i % EXPORT_BATCH_SIZE == 0:
                     batch_end = min(pages, i + EXPORT_BATCH_SIZE)
-                    batch = list(range(i+1, batch_end+1))
+                    batch = list(range(i + 1, batch_end + 1))
                     if progress_cb:
                         progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
                     load_page_batch(driver, batch)
@@ -478,11 +490,15 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     f.write(pdf_bytes)
                 files.append(p)
 
-                if progress_cb and (i+1) % 5 == 0:
+                # Free the raw bytes immediately
+                del pdf_bytes
+
+                if progress_cb and (i + 1) % 5 == 0:
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
 
-                if (i+1) % EXPORT_BATCH_SIZE == 0 or (i+1) == pages:
+                if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
+                    gc.collect()
 
             if progress_cb:
                 progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
@@ -588,13 +604,12 @@ def safe_upload(chat_id, file_path, caption, reply_to_id):
     for attempt in range(1, 4):
         try:
             with open(file_path, "rb") as f:
-                # ONLY use standard 'timeout' parameter
                 bot.send_document(
                     chat_id, f,
                     caption=caption,
                     reply_to_message_id=reply_to_id,
                     parse_mode="HTML",
-                    timeout=600  # 10 minutes for slow Render network
+                    timeout=600,
                 )
             return True
         except Exception as e:
@@ -627,9 +642,11 @@ def process_job(job):
         if cached:
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
             success = safe_upload(
-                chat_id, cached, 
-                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>", 
-                job.reply_to_id
+                chat_id, cached,
+                f"✅ <b>Delivered from cache</b>\n\n"
+                f"⚡ Fetched in under a second.\n\n"
+                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                job.reply_to_id,
             )
             if success:
                 db.increment_jobs()
@@ -677,7 +694,7 @@ def process_job(job):
                 f"📦 <b>Size:</b> {size/1024/1024:.1f} MB\n"
                 f"⏱ <b>Time:</b> {elapsed:.1f}s\n\n"
                 f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
-                job.reply_to_id
+                job.reply_to_id,
             )
 
             if success:
@@ -910,7 +927,7 @@ def main():
     threading.Thread(target=warm, daemon=True).start()
 
     jobs, users = db.get_stats()
-    print(f"📚 Khan's Scribd Downloader online")
+    print("📚 Khan's Scribd Downloader online")
     print(f"   Total jobs delivered: {jobs:,}")
     print(f"   Total users served:   {users:,}")
 
