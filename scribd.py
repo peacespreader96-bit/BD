@@ -48,9 +48,9 @@ EXPORT_BATCH_SIZE = 4
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
-MAX_JOB_SECONDS   = 1200
+MAX_JOB_SECONDS   = 900  # 15 minutes hard cap
 MAX_CACHE_BYTES   = 400 * 1024 * 1024
-LAST_JOB_DURATION = 30.0
+LAST_JOB_DURATION = 30.0 # Tracks previous job speed for dynamic queue estimates
 
 SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
 
@@ -233,12 +233,6 @@ class BrowserManager:
                 opts.add_argument("--no-first-run")
                 opts.add_argument("--safebrowsing-disable-auto-update")
                 opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
-                opts.add_argument("--aggressive-cache-discard")
-                opts.add_argument("--disable-background-timer-throttling")
-                opts.add_argument("--disable-backgrounding-occluded-windows")
-                opts.add_argument("--disable-renderer-backgrounding")
-                opts.add_argument("--disable-ipc-flooding-protection")
-                opts.add_argument("--memory-pressure-off")
                 
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
@@ -257,8 +251,7 @@ class BrowserManager:
         raise RuntimeError("Chrome failed to launch after 3 attempts")
 
     def reset_between_jobs(self):
-        if self.driver is None:
-            return
+        if self.driver is None: return
         try:
             self.driver.get("about:blank")
             self.driver.delete_all_cookies()
@@ -275,10 +268,8 @@ class BrowserManager:
 
     def _kill(self):
         try:
-            if self.driver:
-                self.driver.quit()
-        except Exception:
-            pass
+            if self.driver: self.driver.quit()
+        except Exception: pass
         self.driver = None
 
 browser = BrowserManager()
@@ -306,8 +297,7 @@ def cache_store(doc_id, src_path):
             try: os.remove(old)
             except: pass
             total -= sz
-            if total < MAX_CACHE_BYTES * 0.7:
-                break
+            if total < MAX_CACHE_BYTES * 0.7: break
     shutil.copyfile(src_path, cache_path(doc_id))
 
 # ==============================================================
@@ -319,8 +309,7 @@ def is_scribd_url(url):
 
 def extract_doc_id(url):
     m = re.search(r"scribd\.com/(?:document|doc|read)/(\d+)", url)
-    if not m:
-        raise ValueError("Invalid Scribd URL")
+    if not m: raise ValueError("Invalid Scribd URL")
     return m.group(1)
 
 def embed_url_for(url):
@@ -330,22 +319,13 @@ def configure_timeout(driver, seconds):
     try:
         exec_ = driver.command_executor
         cfg = getattr(exec_, "client_config", None) or getattr(exec_, "_client_config", None)
-        if cfg:
-            cfg.timeout = seconds
-    except Exception:
-        pass
-
-def get_batch_size(total_pages):
-    if total_pages > 150: return 2
-    if total_pages > 80:  return 3
-    return EXPORT_BATCH_SIZE
+        if cfg: cfg.timeout = seconds
+    except: pass
 
 def wait_for_pages(driver, timeout=60):
     driver.set_script_timeout(timeout + 5)
     return int(driver.execute_async_script("""
-        const budget = arguments[0];
-        const done   = arguments[arguments.length - 1];
-        const start  = performance.now();
+        const budget = arguments[0], done = arguments[arguments.length - 1], start = performance.now();
         function tick() {
             const n = document.querySelectorAll('.outer_page').length;
             if (n > 0) { done(n); return; }
@@ -355,21 +335,18 @@ def wait_for_pages(driver, timeout=60):
         tick();
     """, timeout * 1000) or 0)
 
-def load_page_batch(driver, nums, timeout=120):
+def load_page_batch(driver, nums, timeout=45): # Reduced timeout so it fails fast and retries
     configure_timeout(driver, timeout + 10)
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
-        const nums      = arguments[0];
-        const timeoutMs = arguments[1];
-        const done      = arguments[arguments.length - 1];
-        const mgr       = window.docManager;
+        const nums = arguments[0], timeoutMs = arguments[1], done = arguments[arguments.length - 1];
+        const mgr = window.docManager;
         if (!mgr || !mgr.pages) { done({supported: false}); return; }
         const states = nums.map(n => ({ pageNum: n, page: mgr.pages[n], error: null }));
-        const start  = Date.now();
+        const start = Date.now();
         for (const s of states) {
             if (!s.page) { s.error = 'missing'; continue; }
-            try { if (!s.page.innerPageElem) s.page.load(); }
-            catch (e) { s.error = String(e); }
+            try { if (!s.page.innerPageElem) s.page.load(); } catch (e) { s.error = String(e); }
         }
         const timer = setInterval(() => {
             let ready = 0;
@@ -377,10 +354,8 @@ def load_page_batch(driver, nums, timeout=120):
                 if (s.error) { ready++; continue; }
                 const p = s.page;
                 if (!p.innerPageElem) continue;
-                try {
-                    p.display();
-                    if (!p._imagesTurnedOn) p.turnOnImages();
-                } catch (e) { s.error = String(e); ready++; continue; }
+                try { p.display(); if (!p._imagesTurnedOn) p.turnOnImages(); } 
+                catch (e) { s.error = String(e); ready++; continue; }
                 const imgs = Array.from(p.innerPageElem.querySelectorAll('img'));
                 if (imgs.every(i => i.complete || i.naturalWidth === 0)) ready++;
             }
@@ -391,50 +366,13 @@ def load_page_batch(driver, nums, timeout=120):
             }
             if (Date.now() - start >= timeoutMs) {
                 clearInterval(timer);
-                done({supported: true, failed: states.filter(s => s.error || !s.page.innerPageElem).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
+                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
             }
         }, 50);
     """, list(nums), timeout * 1000)
     if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
     return result
-
-def preload_pages_async(driver, nums):
-    driver.execute_script("""
-        const mgr = window.docManager;
-        if (!mgr || !mgr.pages) return;
-        for (const n of arguments[0]) {
-            const p = mgr.pages[n];
-            if (!p) continue;
-            try { p.load(); } catch(e) {}
-            try { p.display(); } catch(e) {}
-            try { if (!p._imagesTurnedOn) p.turnOnImages(); } catch(e) {}
-        }
-    """, list(nums))
-
-def wait_for_batch_ready(driver, nums, timeout=120):
-    driver.set_script_timeout(timeout + 10)
-    result = driver.execute_async_script("""
-        const nums = arguments[0], ms = arguments[1];
-        const done = arguments[arguments.length - 1];
-        const mgr = window.docManager;
-        if (!mgr || !mgr.pages) { done(false); return; }
-        const start = Date.now();
-        const t = setInterval(() => {
-            let ok = 0;
-            for (const n of nums) {
-                const p = mgr.pages[n];
-                if (!p || !p.innerPageElem) continue;
-                if (Array.from(p.innerPageElem.querySelectorAll('img')).every(i => i.complete || i.naturalWidth === 0)) ok++;
-            }
-            if (ok === nums.length) {
-                clearInterval(t); done(true);
-            } else if (Date.now() - start >= ms) {
-                clearInterval(t); done(false);
-            }
-        }, 50);
-    """, list(nums), timeout * 1000)
-    return bool(result)
 
 def release_batch(driver, nums):
     driver.execute_script("""
@@ -445,10 +383,8 @@ def release_batch(driver, nums):
             if (p) { try { p.remove(); } catch (e) {} }
         }
     """, list(nums))
-    try:
-        driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
-    except Exception:
-        pass
+    try: driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
+    except: pass
     gc.collect()
 
 def hide_cookies(driver):
@@ -466,43 +402,20 @@ def prepare_for_print(driver):
         const top = document.querySelector('.toolbar_top');    if (top) top.remove();
         const bot = document.querySelector('.toolbar_bottom'); if (bot) bot.remove();
         document.querySelectorAll('.document_scroller').forEach(el => {
-            el.style.position  = 'static';
-            el.style.overflow  = 'visible';
-            el.style.height    = 'auto';
-            el.style.maxHeight = 'none';
-            el.style.margin    = '0';
-            el.style.padding   = '0';
+            el.style.position  = 'static'; el.style.overflow  = 'visible'; el.style.height    = 'auto';
+            el.style.maxHeight = 'none'; el.style.margin    = '0'; el.style.padding   = '0';
         });
     """)
 
-def mid_job_reset(driver, embed_url):
-    try:
-        driver.get("about:blank")
-        time.sleep(0.5)
-        driver.get(embed_url)
-        wait_for_pages(driver, 60)
-        hide_cookies(driver)
-        prepare_for_print(driver)
-        configure_timeout(driver, CDP_TIMEOUT)
-    except Exception as e:
-        logger.error(f"[mid-job reset] {e}")
-
 def export_page_to_pdf(driver, index, page_count):
     info = driver.execute_script("""
-        const i = arguments[0];
-        const pages = Array.from(document.querySelectorAll('.outer_page'));
-        const target = pages[i];
+        const i = arguments[0], pages = Array.from(document.querySelectorAll('.outer_page')), target = pages[i];
         if (!target) return null;
-        const old = document.getElementById('isolated-print-css');
-        if (old) old.remove();
+        const old = document.getElementById('isolated-print-css'); if (old) old.remove();
         pages.forEach(p => {
-            ['display','visibility','position','top','left','right','bottom','margin',
-             'break-after','page-break-after','break-before','page-break-before']
-                .forEach(prop => p.style.removeProperty(prop));
+            ['display','visibility','position','top','left','right','bottom','margin','break-after','page-break-after','break-before','page-break-before'].forEach(prop => p.style.removeProperty(prop));
         });
-        const r = target.getBoundingClientRect();
-        const w = Math.ceil(r.width);
-        const h = Math.ceil(r.height);
+        const r = target.getBoundingClientRect(), w = Math.ceil(r.width), h = Math.ceil(r.height);
         pages.forEach(p => p.removeAttribute('data-export-target'));
         target.setAttribute('data-export-target','true');
         const s = document.createElement('style');
@@ -510,45 +423,20 @@ def export_page_to_pdf(driver, index, page_count):
         s.textContent = `
             @page { size: ${w}px ${h}px; margin: 0; }
             @media print {
-                html, body {
-                    width: ${w}px !important; height: ${h}px !important;
-                    min-width: ${w}px !important; min-height: ${h}px !important;
-                    max-width: ${w}px !important; max-height: ${h}px !important;
-                    margin: 0 !important; padding: 0 !important;
-                    overflow: hidden !important;
-                    -webkit-print-color-adjust: exact !important;
-                    print-color-adjust: exact !important;
-                }
+                html, body { width: ${w}px !important; height: ${h}px !important; min-width: ${w}px !important; min-height: ${h}px !important; max-width: ${w}px !important; max-height: ${h}px !important; margin: 0 !important; padding: 0 !important; overflow: hidden !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
                 .outer_page { display: none !important; }
-                .outer_page[data-export-target="true"] {
-                    display: block !important; visibility: visible !important;
-                    position: absolute !important;
-                    top: 0 !important; left: 0 !important;
-                    width: ${w}px !important; height: ${h}px !important;
-                    margin: 0 !important; padding: 0 !important;
-                    overflow: hidden !important;
-                }
+                .outer_page[data-export-target="true"] { display: block !important; visibility: visible !important; position: absolute !important; top: 0 !important; left: 0 !important; width: ${w}px !important; height: ${h}px !important; margin: 0 !important; padding: 0 !important; overflow: hidden !important; }
             }
         `;
-        document.head.appendChild(s);
-        return { width: w, height: h };
+        document.head.appendChild(s); return { width: w, height: h };
     """, index)
-    if not info:
-        raise RuntimeError(f"Page {index+1}/{page_count} missing")
-    w_in = int(info["width"]) / 96.0
-    h_in = int(info["height"]) / 96.0
+    if not info: raise RuntimeError(f"Page {index+1}/{page_count} missing")
+    w_in, h_in = int(info["width"]) / 96.0, int(info["height"]) / 96.0
     driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
     result = driver.execute_cdp_cmd("Page.printToPDF", {
-        "landscape": False,
-        "displayHeaderFooter": False,
-        "printBackground": True,
-        "scale": 1,
-        "paperWidth": w_in,
-        "paperHeight": h_in,
-        "marginTop": 0, "marginBottom": 0, "marginLeft": 0, "marginRight": 0,
-        "preferCSSPageSize": True,
-        "pageRanges": "1",
-        "transferMode": "ReturnAsBase64",
+        "landscape": False, "displayHeaderFooter": False, "printBackground": True, "scale": 1,
+        "paperWidth": w_in, "paperHeight": h_in, "marginTop": 0, "marginBottom": 0, "marginLeft": 0, "marginRight": 0,
+        "preferCSSPageSize": True, "pageRanges": "1", "transferMode": "ReturnAsBase64",
     })
     return base64.b64decode(result["data"])
 
@@ -559,57 +447,31 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
     try:
         driver.get(embed)
         hide_cookies(driver)
-
         pages = wait_for_pages(driver, 60)
-        if pages <= 0:
-            raise RuntimeError("No printable pages detected")
-        if progress_cb:
-            progress_cb(f"📄 Detected <b>{pages}</b> pages. Preparing...")
+        if pages <= 0: raise RuntimeError("No printable pages detected")
+        if progress_cb: progress_cb(f"📄 Detected <b>{pages}</b> pages. Preparing...")
 
         prepare_for_print(driver)
-        configure_timeout(driver, CDP_TIMEOUT)
-
         spool = tempfile.TemporaryDirectory(prefix="scribd-pages-")
         files = []
-        batch_size = get_batch_size(pages)
-        just_reset = False
 
         try:
             for i in range(pages):
-                if i % batch_size == 0:
-                    batch_end = min(pages, i + batch_size)
+                if i % EXPORT_BATCH_SIZE == 0:
+                    batch_end = min(pages, i + EXPORT_BATCH_SIZE)
                     batch = list(range(i + 1, batch_end + 1))
+                    if progress_cb: progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
                     
-                    if progress_cb:
-                        progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
-
-                    if i == 0 or just_reset:
-                        res = load_page_batch(driver, batch)
-                        just_reset = False
-                    else:
-                        if not wait_for_batch_ready(driver, batch):
-                            logger.warning(f"Batch {i+1}-{batch_end} timed out during preload. Forcing reload.")
-                            res = load_page_batch(driver, batch)
-                        else:
-                            res = {"failed": []}
-
+                    # Pure sequential loading, no pre-fetching lag
+                    res = load_page_batch(driver, batch)
                     if res.get("failed"):
                         logger.warning(f"Some pages in batch failed: {res['failed']}")
 
-                    next_start = batch_end + 1
-                    is_mid_job_reset_pending = (batch_end % 50 == 0) and (batch_end < pages)
-                    
-                    if next_start <= pages and not is_mid_job_reset_pending:
-                        nb_end = min(pages, batch_end + batch_size)
-                        preload_pages_async(driver, list(range(next_start, nb_end + 1)))
-
                 pdf_bytes = export_page_to_pdf(driver, i, pages)
-                if len(PdfReader(BytesIO(pdf_bytes)).pages) != 1:
-                    raise RuntimeError(f"Page {i+1} render failed")
+                if len(PdfReader(BytesIO(pdf_bytes)).pages) != 1: raise RuntimeError(f"Page {i+1} render failed")
 
                 p = os.path.join(spool.name, f"p-{i+1:05d}.pdf")
-                with open(p, "wb") as f:
-                    f.write(pdf_bytes)
+                with open(p, "wb") as f: f.write(pdf_bytes)
                 files.append(p)
                 del pdf_bytes
 
@@ -617,38 +479,20 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
                     logger.info(f"Exported {i+1}/{pages}")
 
-                if (i + 1) % batch_size == 0 or (i + 1) == pages:
+                if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
-                    time.sleep(0.2)
-                    
-                    if (i + 1) % 50 == 0 and (i + 1) < pages:
-                        if progress_cb:
-                            progress_cb(f"♻️ Refreshing engine at page <b>{i+1}</b>...")
-                        logger.info(f"Refreshing Chrome at page {i+1}")
-                        mid_job_reset(driver, embed)
-                        just_reset = True
 
-            if progress_cb:
-                progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
+            if progress_cb: progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
             logger.info(f"Stitching {len(files)} pages into PDF")
-
             writer = PdfWriter()
             try:
-                for p in files:
-                    writer.append(p)
-                with open(output_path, "wb") as out:
-                    writer.write(out)
-            finally:
-                writer.close()
-        finally:
-            spool.cleanup()
+                for p in files: writer.append(p)
+                with open(output_path, "wb") as out: writer.write(out)
+            finally: writer.close()
+        finally: spool.cleanup()
     finally:
-        try:
-            browser.reset_between_jobs()
-            browser.maybe_restart()
-        except Exception as ex:
-            logger.error(f"[browser restart error] {ex}")
-
+        try: browser.reset_between_jobs(); browser.maybe_restart()
+        except Exception as ex: logger.error(f"[browser restart error] {ex}")
     return pages
 
 # ==============================================================
@@ -656,22 +500,15 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 # ==============================================================
 
 def format_duration(seconds):
-    if seconds < 60:
-        return f"{int(seconds)}s"
+    if seconds < 60: return f"{int(seconds)}s"
     mins = int(seconds // 60)
     secs = int(seconds % 60)
-    if secs == 0:
-        return f"{mins}m"
-    return f"{mins}m {secs}s"
+    return f"{mins}m {secs}s" if secs > 0 else f"{mins}m"
 
 class Job:
     def __init__(self, chat_id, user_id, url, status_msg_id, reply_to_id, user_name):
-        self.chat_id       = chat_id
-        self.user_id       = user_id
-        self.url           = url
-        self.status_msg_id = status_msg_id
-        self.reply_to_id   = reply_to_id
-        self.user_name     = user_name
+        self.chat_id, self.user_id, self.url = chat_id, user_id, url
+        self.status_msg_id, self.reply_to_id, self.user_name = status_msg_id, reply_to_id, user_name
 
 class QueueManager:
     def __init__(self):
@@ -688,6 +525,29 @@ class QueueManager:
             self.pending.append(job)
             return len(self.pending)
 
+    def cancel(self, user_id):
+        with self.lock:
+            # 1. Remove from pending
+            before = len(self.pending)
+            self.pending = deque(j for j in self.pending if j.user_id != user_id)
+            removed_pending = before - len(self.pending)
+            
+            # 2. Kill active job if it belongs to this user
+            killed_active = False
+            if self.active and self.active.user_id == user_id:
+                killed_active = True
+                logger.warning(f"[cancel] User {user_id} killed active job. Terminating Chrome.")
+                browser._kill() # This forces Selenium to throw an exception, breaking the hang
+                self.active = None
+                
+                # Start next job since we killed this one
+                if self.pending:
+                    next_job = self.pending.popleft()
+                    self.active = next_job
+                    threading.Thread(target=self._run, args=(next_job,), daemon=True).start()
+                    
+            return removed_pending, killed_active
+
     def _run(self, job):
         try:
             process_job(job)
@@ -695,40 +555,37 @@ class QueueManager:
             logger.error(f"Queue error: {traceback.format_exc()}")
         finally:
             with self.lock:
-                self.active = None
-                next_job = None
-                if self.pending:
-                    next_job = self.pending.popleft()
-                    self.active = next_job
-                    threading.Thread(target=self._run, args=(next_job,), daemon=True).start()
+                if self.active is job: # Check if we weren't manually killed
+                    self.active = None
+                    next_job = None
+                    if self.pending:
+                        next_job = self.pending.popleft()
+                        self.active = next_job
+                        threading.Thread(target=self._run, args=(next_job,), daemon=True).start()
 
-                remaining = list(self.pending)
-                next_id   = next_job.status_msg_id if next_job else None
-                chat_nex  = next_job.chat_id if next_job else None
+                    remaining = list(self.pending)
+                    next_id   = next_job.status_msg_id if next_job else None
+                    chat_nex  = next_job.chat_id if next_job else None
 
-            if next_job:
-                try:
-                    bot.edit_message_text(
-                        "🚀 <b>It's your turn!</b>\n\nStarting download now...",
-                        chat_id=chat_nex, message_id=next_id, parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                    if next_job:
+                        try:
+                            bot.edit_message_text(
+                                "🚀 <b>It's your turn!</b>\n\nStarting download now...",
+                                chat_id=chat_nex, message_id=next_id, parse_mode="HTML",
+                            )
+                        except: pass
 
-            for i, wj in enumerate(remaining):
-                estimated_wait = LAST_JOB_DURATION * (i + 1)
-                wait_str = format_duration(estimated_wait)
-                try:
-                    bot.edit_message_text(
-                        f"⏳ <b>Queue update</b>\n\n"
-                        f"📍 You are now <b>#{i+1}</b> in line.\n"
-                        f"⏱ Est. wait: <b>~{wait_str}</b>\n\n"
-                        f"<i>Thanks for your patience!</i>",
-                        chat_id=wj.chat_id, message_id=wj.status_msg_id, parse_mode="HTML",
-                    )
-                    time.sleep(0.02)
-                except Exception:
-                    pass
+                    for i, wj in enumerate(remaining):
+                        wait_str = format_duration(LAST_JOB_DURATION * (i + 1))
+                        try:
+                            bot.edit_message_text(
+                                f"⏳ <b>Queue update</b>\n\n"
+                                f"📍 You are now <b>#{i+1}</b> in line.\n"
+                                f"⏱ Est. wait: <b>~{wait_str}</b>\n\n"
+                                f"<i>Thanks for your patience!</i>",
+                                chat_id=wj.chat_id, message_id=wj.status_msg_id, parse_mode="HTML",
+                            )
+                        except: pass
 
 queue = QueueManager()
 
@@ -740,16 +597,11 @@ def safe_upload(chat_id, file_path, caption, reply_to_id):
     for attempt in range(1, 4):
         try:
             with open(file_path, "rb") as f:
-                bot.send_document(
-                    chat_id, f, caption=caption,
-                    reply_to_message_id=reply_to_id,
-                    parse_mode="HTML", timeout=600,
-                )
+                bot.send_document(chat_id, f, caption=caption, reply_to_message_id=reply_to_id, parse_mode="HTML", timeout=600)
             return True
         except Exception as e:
             logger.error(f"[upload attempt {attempt}] Failed: {e}")
-            if attempt < 3:
-                time.sleep(3)
+            if attempt < 3: time.sleep(3)
     return False
 
 # ==============================================================
@@ -758,8 +610,7 @@ def safe_upload(chat_id, file_path, caption, reply_to_id):
 
 def process_job(job):
     global LAST_JOB_DURATION
-    chat_id = job.chat_id
-    msg_id  = job.status_msg_id
+    chat_id, msg_id = job.chat_id, job.status_msg_id
     start = time.time()
     timeout_occurred = False
 
@@ -773,10 +624,8 @@ def process_job(job):
     timer.start()
 
     def edit(text):
-        try:
-            bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-        except Exception:
-            pass
+        try: bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
+        except: pass
 
     try:
         doc_id = extract_doc_id(job.url)
@@ -787,21 +636,18 @@ def process_job(job):
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
             success = safe_upload(
                 chat_id, cached,
-                f"✅ <b>Delivered from cache</b>\n\n"
-                f"⚡ Fetched in under a second.\n\n"
-                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
                 job.reply_to_id,
             )
             if success:
-                db.increment_jobs()
-                db.increment_user_downloads(job.user_id)
+                db.increment_jobs(); db.increment_user_downloads(job.user_id)
                 try: bot.delete_message(chat_id, msg_id)
-                except Exception: pass
+                except: pass
                 return
             else:
                 logger.warning(f"[cache upload fail] Removing corrupt cache for {doc_id}")
                 try: os.remove(cached)
-                except Exception: pass
+                except: pass
 
         edit("🚀 <b>Starting now...</b>\n\n⚙️ Booting engine...")
 
@@ -810,45 +656,34 @@ def process_job(job):
             output_pdf = os.path.join(workdir, f"scribd_{doc_id}.pdf")
             pages = fetch_scribd_pdf(job.url, output_pdf, progress_cb=edit)
 
-            if not os.path.exists(output_pdf):
-                raise RuntimeError("PDF generation failed")
+            if not os.path.exists(output_pdf): raise RuntimeError("PDF generation failed")
 
             size = os.path.getsize(output_pdf)
             if size > MAX_TG_UPLOAD:
                 edit(f"❌ <b>File too large</b>\n\nThe PDF is {size/1024/1024:.1f} MB — Telegram's bot limit is 50 MB.")
                 return
 
-            try:
-                cache_store(doc_id, output_pdf)
-            except Exception as e:
-                logger.error(f"Cache store failed: {e}")
+            try: cache_store(doc_id, output_pdf)
+            except: pass
 
             elapsed = time.time() - start
             edit("📤 <b>Uploading to Telegram...</b>")
 
             success = safe_upload(
                 chat_id, output_pdf,
-                f"✅ <b>Download complete!</b>\n\n"
-                f"📄 <b>Doc ID:</b> <code>{doc_id}</code>\n"
-                f"📑 <b>Pages:</b> {pages}\n"
-                f"📦 <b>Size:</b> {size/1024/1024:.1f} MB\n"
-                f"⏱ <b>Time:</b> {elapsed:.1f}s\n\n"
-                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Download complete!</b>\n\n📄 <b>Doc ID:</b> <code>{doc_id}</code>\n📑 <b>Pages:</b> {pages}\n📦 <b>Size:</b> {size/1024/1024:.1f} MB\n⏱ <b>Time:</b> {elapsed:.1f}s\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
                 job.reply_to_id,
             )
 
             if success:
-                db.increment_jobs()
-                db.increment_user_downloads(job.user_id)
+                db.increment_jobs(); db.increment_user_downloads(job.user_id)
                 try: bot.delete_message(chat_id, msg_id)
-                except Exception: pass
-                
+                except: pass
                 if not timeout_occurred and elapsed > 5:
                     LAST_JOB_DURATION = elapsed
                     logger.info(f"Job finished in {elapsed:.1f}s")
             else:
                 edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
-
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -877,15 +712,22 @@ def process_job(job):
 
 @bot.message_handler(commands=["log"])
 def cmd_log(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
-        return
-    if not log_buffer:
-        bot.reply_to(message, "No logs yet.")
-        return
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    if not log_buffer: return bot.reply_to(message, "No logs yet.")
     text = "\n".join(log_buffer)
-    if len(text) > 4000:
-        text = "... (truncated)\n" + text[-4000:]
+    if len(text) > 4000: text = "... (truncated)\n" + text[-4000:]
     bot.reply_to(message, f"<b>System Logs:</b>\n<pre>{html.escape(text)}</pre>", parse_mode="HTML")
+
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message):
+    uid = message.from_user.id
+    removed, killed = queue.cancel(uid)
+    if killed:
+        bot.reply_to(message, "🛑 <b>Active job killed.</b>\n\nI've cleared the queue for you and moved to the next person.", parse_mode="HTML")
+    elif removed > 0:
+        bot.reply_to(message, "✅ <b>Removed from queue.</b>", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "ℹ️ You're not in the queue.", parse_mode="HTML")
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -909,9 +751,7 @@ def cmd_start(message):
 
     help_block = (
         "📖 <b>How to use</b>\n"
-        "1️⃣ Copy a Scribd link\n"
-        "2️⃣ Paste it here\n"
-        "3️⃣ Get your PDF!\n\n"
+        "1️⃣ Copy a Scribd link\n2️⃣ Paste it here\n3️⃣ Get your PDF!\n\n"
         "☕ /support — keep the server running"
     )
 
@@ -921,30 +761,15 @@ def cmd_start(message):
             f"Hey <b>{name}</b>, I turn Scribd links into beautiful PDFs in seconds.\n\n"
             f"🚫 <b>100% Free.</b> No ads. No redirects. No spam.\n"
             f"🛠 Hosted personally by the Dev.\n\n"
-            f"{stats_block}\n"
-            f"{help_block}"
+            f"{stats_block}\n{help_block}"
         )
     else:
         text = (
             f"👋 <b>Welcome back, {name}!</b>\n\n"
             f"📊 Your downloads: <code>{my_downloads:,}</code>\n\n"
-            f"{stats_block}\n"
-            f"{help_block}"
+            f"{stats_block}\n{help_block}"
         )
-
     bot.reply_to(message, text, parse_mode="HTML")
-
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message):
-    uid = message.from_user.id
-    with queue.lock:
-        before = len(queue.pending)
-        queue.pending = deque(j for j in queue.pending if j.user_id != uid)
-        removed = before - len(queue.pending)
-    if removed:
-        bot.reply_to(message, "✅ <b>Removed from queue.</b>", parse_mode="HTML")
-    else:
-        bot.reply_to(message, "ℹ️ You're not in the pending queue.", parse_mode="HTML")
 
 @bot.message_handler(commands=["setgoal"])
 def cmd_setgoal(message):
@@ -954,7 +779,7 @@ def cmd_setgoal(message):
     try:
         amount = int(parts[1]); db.set_donation("donation_goal", amount)
         bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception: bot.reply_to(message, "Usage: /setgoal 10")
+    except: bot.reply_to(message, "Usage: /setgoal 10")
 
 @bot.message_handler(commands=["setdonation"])
 def cmd_setdonation(message):
@@ -964,40 +789,28 @@ def cmd_setdonation(message):
     try:
         amount = int(parts[1]); db.set_donation("donation_raised", amount)
         bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception: bot.reply_to(message, "Usage: /setdonation 5")
+    except: bot.reply_to(message, "Usage: /setdonation 5")
 
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     text = (
         "📖 <b>How to use Khan's Scribd Downloader</b>\n\n"
-        "1️⃣ Open Scribd in your browser\n"
-        "2️⃣ Copy the link of the document you want\n"
-        "3️⃣ Paste it here\n\n"
+        "1️⃣ Open Scribd in your browser\n2️⃣ Copy the link\n3️⃣ Paste it here\n\n"
         "I'll fetch the full PDF and send it back to you.\n\n"
-        "🔗 <b>Supported formats:</b>\n"
-        "<code>https://www.scribd.com/document/…</code>\n"
-        "<code>https://www.scribd.com/doc/…</code>\n\n"
-        "⚡ <b>Features</b>\n"
-        "• Free forever\n"
-        "• Zero ads\n"
-        "• Fair queuing (you'll see your place in line)\n"
-        "• Cache — instant for repeat documents\n\n"
+        "🔗 <b>Supported formats:</b>\n<code>https://www.scribd.com/document/…</code>\n<code>https://www.scribd.com/doc/…</code>\n\n"
+        "⚡ <b>Features</b>\n• Free forever\n• Zero ads\n• Fair queuing\n• Cache\n\n"
         "☕ /support — keep the server running"
     )
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
-    jobs, users = db.get_stats()
-    goal, raised = db.get_donations()
+    jobs, users = db.get_stats(); goal, raised = db.get_donations()
     percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
     bot.reply_to(
         message,
-        f"🔢 <b>Live Stats</b>\n\n"
-        f"👥 Users: <code>{users:,}</code>\n"
-        f"✅ Documents delivered: <code>{jobs:,}</code>\n\n"
-        f"💰 Server Cost\n"
-        f"🎯 Goal: <code>${goal}</code> | 💵 Raised: <code>${raised}</code> ({percent}%)",
+        f"🔢 <b>Live Stats</b>\n\n👥 Users: <code>{users:,}</code>\n✅ Documents delivered: <code>{jobs:,}</code>\n\n"
+        f"💰 Server Cost\n🎯 Goal: <code>${goal}</code> | 💵 Raised: <code>${raised}</code> ({percent}%)",
         parse_mode="HTML",
     )
 
@@ -1005,10 +818,8 @@ def cmd_stats(message):
 def cmd_support(message):
     text = (
         "☕ <b>Support the Dev</b>\n\n"
-        "Khan's Scribd Downloader is completely free.\n"
-        "No ads. No trackers. No hidden fees.\n\n"
-        "Server costs come straight out of my pocket.\n"
-        "If this bot saves you time, you can buy me a coffee:\n\n"
+        "Khan's Scribd Downloader is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
+        "Server costs come straight out of my pocket.\nIf this bot saves you time, you can buy me a coffee:\n\n"
         f"☕ <a href='{SUPPORT_URL}'>Buy Me a Coffee</a>\n\n"
         "Or just share the bot with a friend — that helps too. 💙"
     )
@@ -1020,51 +831,33 @@ def cmd_text(message):
     if text.startswith("/"): return
 
     if not is_scribd_url(text):
-        bot.reply_to(
-            message,
-            "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n"
-            "<code>https://www.scribd.com/document/123456789/Title</code>",
-            parse_mode="HTML",
-        )
+        bot.reply_to(message, "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n<code>https://www.scribd.com/document/123456789/Title</code>", parse_mode="HTML")
         return
 
     u = message.from_user
     db.register_user(u.id, u.username or "", u.first_name or "")
 
-    try:
-        status = bot.reply_to(message, "⏳ <b>Received!</b>\n\nChecking queue...", parse_mode="HTML")
-    except Exception:
-        return
+    try: status = bot.reply_to(message, "⏳ <b>Received!</b>\n\nChecking queue...", parse_mode="HTML")
+    except: return
 
     job = Job(
-        chat_id=message.chat.id,
-        user_id=u.id,
-        url=text,
-        status_msg_id=status.message_id,
-        reply_to_id=message.message_id,
+        chat_id=message.chat.id, user_id=u.id, url=text,
+        status_msg_id=status.message_id, reply_to_id=message.message_id,
         user_name=u.first_name or "friend",
     )
 
     pos = queue.add(job)
-
-    if pos == 0:
-        return
+    if pos == 0: return
 
     estimated_wait = LAST_JOB_DURATION * pos
     wait_str = format_duration(estimated_wait)
 
     try:
         bot.edit_message_text(
-            f"⏳ <b>You're in line!</b>\n\n"
-            f"📍 Position: <b>#{pos}</b>\n"
-            f"⏱ Est. wait: <b>~{wait_str}</b>\n\n"
-            f"<i>I'll ping you when it's your turn.</i>",
-            chat_id=message.chat.id,
-            message_id=status.message_id,
-            parse_mode="HTML",
+            f"⏳ <b>You're in line!</b>\n\n📍 Position: <b>#{pos}</b>\n⏱ Est. wait: <b>~{wait_str}</b>\n\n<i>I'll ping you when it's your turn.</i>",
+            chat_id=message.chat.id, message_id=status.message_id, parse_mode="HTML",
         )
-    except Exception:
-        pass
+    except: pass
 
 # ==============================================================
 # MAIN
