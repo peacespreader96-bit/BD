@@ -580,6 +580,30 @@ class QueueManager:
 queue = QueueManager()
 
 # ==============================================================
+# UPLOAD HELPER (RETRY LOGIC)
+# ==============================================================
+
+def safe_upload(chat_id, file_path, caption, reply_to_id):
+    """Attempts to upload a document up to 3 times."""
+    for attempt in range(1, 4):
+        try:
+            with open(file_path, "rb") as f:
+                # ONLY use standard 'timeout' parameter
+                bot.send_document(
+                    chat_id, f,
+                    caption=caption,
+                    reply_to_message_id=reply_to_id,
+                    parse_mode="HTML",
+                    timeout=600  # 10 minutes for slow Render network
+                )
+            return True
+        except Exception as e:
+            print(f"[upload attempt {attempt}] Failed: {e}")
+            if attempt < 3:
+                time.sleep(3)
+    return False
+
+# ==============================================================
 # JOB PROCESSOR
 # ==============================================================
 
@@ -601,28 +625,20 @@ def process_job(job):
         # Cache hit?
         cached = cache_lookup(doc_id)
         if cached:
-            try:
-                edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
-                with open(cached, "rb") as f:
-                    bot.send_document(
-                        chat_id, f,
-                        caption=(
-                            f"✅ <b>Delivered from cache</b>\n\n"
-                            f"⚡ Fetched in under a second.\n\n"
-                            f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>"
-                        ),
-                        reply_to_message_id=job.reply_to_id,
-                        parse_mode="HTML",
-                        timeout=300,
-                        read_timeout=300,
-                    )
+            edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
+            success = safe_upload(
+                chat_id, cached, 
+                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>", 
+                job.reply_to_id
+            )
+            if success:
                 db.increment_jobs()
                 db.increment_user_downloads(job.user_id)
                 try: bot.delete_message(chat_id, msg_id)
                 except Exception: pass
                 return
-            except Exception as e:
-                print(f"[cache error] {e}")
+            else:
+                print(f"[cache upload fail] Removing corrupt cache for {doc_id}")
                 try: os.remove(cached)
                 except Exception: pass
 
@@ -653,28 +669,24 @@ def process_job(job):
             elapsed = time.time() - start
             edit("📤 <b>Uploading to Telegram...</b>")
 
-            with open(output_pdf, "rb") as f:
-                bot.send_document(
-                    chat_id, f,
-                    caption=(
-                        f"✅ <b>Download complete!</b>\n\n"
-                        f"📄 <b>Doc ID:</b> <code>{doc_id}</code>\n"
-                        f"📑 <b>Pages:</b> {pages}\n"
-                        f"📦 <b>Size:</b> {size/1024/1024:.1f} MB\n"
-                        f"⏱ <b>Time:</b> {elapsed:.1f}s\n\n"
-                        f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>"
-                    ),
-                    reply_to_message_id=job.reply_to_id,
-                    parse_mode="HTML",
-                    timeout=300,
-                    read_timeout=300,
-                )
+            success = safe_upload(
+                chat_id, output_pdf,
+                f"✅ <b>Download complete!</b>\n\n"
+                f"📄 <b>Doc ID:</b> <code>{doc_id}</code>\n"
+                f"📑 <b>Pages:</b> {pages}\n"
+                f"📦 <b>Size:</b> {size/1024/1024:.1f} MB\n"
+                f"⏱ <b>Time:</b> {elapsed:.1f}s\n\n"
+                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                job.reply_to_id
+            )
 
-            db.increment_jobs()
-            db.increment_user_downloads(job.user_id)
-
-            try: bot.delete_message(chat_id, msg_id)
-            except Exception: pass
+            if success:
+                db.increment_jobs()
+                db.increment_user_downloads(job.user_id)
+                try: bot.delete_message(chat_id, msg_id)
+                except Exception: pass
+            else:
+                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
 
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
