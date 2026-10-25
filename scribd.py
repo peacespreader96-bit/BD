@@ -52,7 +52,8 @@ MAX_JOB_SECONDS   = 900  # 15 minutes hard cap
 MAX_CACHE_BYTES   = 400 * 1024 * 1024
 LAST_JOB_DURATION = 30.0 
 
-SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
+# TELEGRAM STARS CONFIG
+STARS_AMOUNT      = 50 # Amount of stars to request
 
 # ==============================================================
 # LOGGING SETUP
@@ -121,9 +122,16 @@ class Database:
                     username TEXT,
                     first_name TEXT,
                     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    total_downloads INTEGER DEFAULT 0
+                    total_downloads INTEGER DEFAULT 0,
+                    total_stars INTEGER DEFAULT 0
                 )
             """)
+            # Safe migration for existing DBs
+            try:
+                c.execute("ALTER TABLE users ADD COLUMN total_stars INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass # Column already exists
+                
             c.execute("""
                 CREATE TABLE IF NOT EXISTS stats (
                     key TEXT PRIMARY KEY,
@@ -135,6 +143,7 @@ class Database:
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_goal', 7)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('donation_raised', 0)")
             c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('max_pages_limit', 80)")
+            c.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('total_stars', 0)")
 
     def register_user(self, user_id, username, first_name):
         with self.lock:
@@ -156,26 +165,26 @@ class Database:
         with self.lock:
             with self._conn() as c:
                 c.execute("UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?", (user_id,))
+                
+    def add_stars(self, user_id, amount):
+        with self.lock:
+            with self._conn() as c:
+                c.execute("UPDATE users SET total_stars = total_stars + ? WHERE user_id = ?", (amount, user_id))
+                c.execute("UPDATE stats SET value = value + ? WHERE key = 'total_stars'", (amount,))
 
     def get_stats(self):
         with self.lock:
             with self._conn() as c:
                 jobs  = c.execute("SELECT value FROM stats WHERE key = 'total_jobs'").fetchone()
                 users = c.execute("SELECT value FROM stats WHERE key = 'total_users'").fetchone()
-                return (jobs["value"] if jobs else 0), (users["value"] if users else 0)
+                stars = c.execute("SELECT value FROM stats WHERE key = 'total_stars'").fetchone()
+                return (jobs["value"] if jobs else 0), (users["value"] if users else 0), (stars["value"] if stars else 0)
 
     def get_user_downloads(self, user_id):
         with self.lock:
             with self._conn() as c:
                 row = c.execute("SELECT total_downloads FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 return row["total_downloads"] if row else 0
-
-    def get_donations(self):
-        with self.lock:
-            with self._conn() as c:
-                goal   = c.execute("SELECT value FROM stats WHERE key = 'donation_goal'").fetchone()
-                raised = c.execute("SELECT value FROM stats WHERE key = 'donation_raised'").fetchone()
-                return (goal["value"] if goal else 7), (raised["value"] if raised else 0)
 
     def set_stat(self, key, value):
         with self.lock:
@@ -235,7 +244,6 @@ class BrowserManager:
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
                 
-                # --- SPEED FLAGS ---
                 opts.add_argument("--js-flags=--max-old-space-size=192")
                 opts.add_argument("--disable-extensions")
                 opts.add_argument("--disable-background-networking")
@@ -667,7 +675,7 @@ def process_job(job):
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
             success = safe_upload(
                 chat_id, cached,
-                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n⭐ /support to tip the dev with Stars!",
                 job.reply_to_id,
             )
             if success:
@@ -702,7 +710,7 @@ def process_job(job):
 
             success = safe_upload(
                 chat_id, output_pdf,
-                f"✅ <b>Download complete!</b>\n\n📄 <b>Doc ID:</b> <code>{doc_id}</code>\n📑 <b>Pages:</b> {pages}\n📦 <b>Size:</b> {size/1024/1024:.1f} MB\n⏱ <b>Time:</b> {elapsed:.1f}s\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Download complete!</b>\n\n📄 <b>Doc ID:</b> <code>{doc_id}</code>\n📑 <b>Pages:</b> {pages}\n📦 <b>Size:</b> {size/1024/1024:.1f} MB\n⏱ <b>Time:</b> {elapsed:.1f}s\n\n⭐ /support to tip the dev with Stars!",
                 job.reply_to_id,
             )
 
@@ -724,7 +732,7 @@ def process_job(job):
             friendly = "❌ <b>Job timed out.</b>\n\nThis document is too large or Scribd is being slow. Please try a smaller document."
         elif "too_many_pages" in err:
             _, pages, limit = str(e).split(":")
-            friendly = f"❌ <b>Document too large</b>\n\nThis document has <b>{pages}</b> pages, but the current limit is <b>{limit}</b> pages to prevent server overload.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a> to raise the limit!"
+            friendly = f"❌ <b>Document too large</b>\n\nThis document has <b>{pages}</b> pages, but the current limit is <b>{limit}</b> pages to prevent server overload."
         elif "invalid" in err or "no printable" in err or "could not find" in err:
             friendly = "❌ <b>Couldn't fetch that document.</b>\n\nIt may be private, region-locked, or Scribd is blocking us right now. Try again in a minute."
         elif "too large" in err:
@@ -743,6 +751,57 @@ def process_job(job):
 # ==============================================================
 # TELEGRAM HANDLERS
 # ==============================================================
+
+# --- STARS PAYMENT HANDLERS ---
+
+@bot.message_handler(commands=["support"])
+def cmd_support(message):
+    text = (
+        "⭐ <b>Support the Dev with Telegram Stars</b>\n\n"
+        "Heart Over Money is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
+        "Server costs come straight out of my pocket.\nIf this bot saves you time, you can send me Stars directly here on Telegram!\n\n"
+        f"👇 Tap the button below to send <b>{STARS_AMOUNT} Stars</b>."
+    )
+    
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(f"Send {STARS_AMOUNT} ⭐", callback_data="send_stars"))
+    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "send_stars")
+def callback_send_stars(call):
+    try:
+        bot.answer_callback_query(call.id)
+        bot.send_invoice(
+            chat_id=call.message.chat.id,
+            title="Support Heart Over Money ⭐",
+            description="Send Telegram Stars to keep the servers running and the PDFs flowing!",
+            invoice_payload="support_donation",
+            provider_token="", # MUST be empty for Stars
+            currency="XTR",    # Telegram Stars currency code
+            prices=[telebot.types.LabeledPrice(label="Support", amount=STARS_AMOUNT)],
+            start_parameter="support-stars"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send invoice: {e}")
+        bot.send_message(call.message.chat.id, "Failed to generate invoice. Please try again later.")
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+def checkout(pre_checkout_query):
+    bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@bot.message_handler(content_types=['successful_payment'])
+def got_payment(message):
+    stars = message.successful_payment.total_amount
+    db.add_stars(message.from_user.id, stars)
+    bot.reply_to(
+        message,
+        f"✅ <b>Thank you so much!</b>\n\n"
+        f"You just sent <b>{stars} ⭐ Stars</b>. I really appreciate the support! "
+        f"Your contribution goes directly toward server costs and keeping the bot free for everyone. 💙",
+        parse_mode="HTML"
+    )
+
+# --- ADMIN COMMANDS ---
 
 @bot.message_handler(commands=["log"])
 def cmd_log(message):
@@ -763,26 +822,6 @@ def cmd_cancel(message):
     else:
         bot.reply_to(message, "ℹ️ You're not in the queue.", parse_mode="HTML")
 
-@bot.message_handler(commands=["setgoal"])
-def cmd_setgoal(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setgoal 10")
-    try:
-        amount = int(parts[1]); db.set_stat("donation_goal", amount)
-        bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
-    except: bot.reply_to(message, "Usage: /setgoal 10")
-
-@bot.message_handler(commands=["setdonation"])
-def cmd_setdonation(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
-    parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setdonation 5")
-    try:
-        amount = int(parts[1]); db.set_stat("donation_raised", amount)
-        bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
-    except: bot.reply_to(message, "Usage: /setdonation 5")
-
 @bot.message_handler(commands=["setlimit"])
 def cmd_setlimit(message):
     if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
@@ -797,7 +836,6 @@ def cmd_setlimit(message):
 def cmd_broadcast(message):
     if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
     
-    # Check if it's a reply or a direct command
     if message.reply_to_message:
         msg_to_send = message.reply_to_message
     elif len(message.text.split(None, 1)) > 1:
@@ -822,7 +860,7 @@ def cmd_broadcast(message):
                 success += 1
             except Exception:
                 blocked += 1
-            time.sleep(0.05) # Prevent Telegram rate limits
+            time.sleep(0.05)
             
         bot.edit_message_text(
             f"✅ <b>Broadcast Finished</b>\n\n"
@@ -836,30 +874,27 @@ def cmd_broadcast(message):
         
     threading.Thread(target=run_broadcast, daemon=True).start()
 
+# --- PUBLIC COMMANDS ---
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
     u = message.from_user
     name = html.escape(u.first_name or "friend")
     is_new = db.register_user(u.id, u.username or "", u.first_name or "")
-    jobs, users = db.get_stats()
+    jobs, users, stars = db.get_stats()
     my_downloads = db.get_user_downloads(u.id)
-    goal, raised = db.get_donations()
-    percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
 
     stats_block = (
         f"🔢 <b>Global Stats</b>\n"
         f"👥 Users served: <code>{users:,}</code>\n"
-        f"✅ Documents delivered: <code>{jobs:,}</code>\n\n"
-        f"💰 <b>Server Cost</b>\n"
-        f"🎯 Goal: <code>${goal}</code>\n"
-        f"💵 Raised: <code>${raised}</code>\n"
-        f"📊 Progress: <code>{percent}%</code>\n"
+        f"✅ Documents delivered: <code>{jobs:,}</code>\n"
+        f"⭐ Stars tipped: <code>{stars:,}</code>\n\n"
     )
 
     help_block = (
         "📖 <b>How to use</b>\n"
         "1️⃣ Copy a Scribd link\n2️⃣ Paste it here\n3️⃣ Get your PDF!\n\n"
-        "☕ /support — keep the server running"
+        "⭐ /support — keep the server running"
     )
 
     if is_new:
@@ -886,32 +921,19 @@ def cmd_help(message):
         "I'll fetch the full PDF and send it back to you.\n\n"
         "🔗 <b>Supported formats:</b>\n<code>https://www.scribd.com/document/…</code>\n<code>https://www.scribd.com/doc/…</code>\n\n"
         "⚡ <b>Features</b>\n• Free forever\n• Zero ads\n• Fair queuing\n• Cache\n\n"
-        "☕ /support — keep the server running"
+        "⭐ /support — keep the server running"
     )
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
-    jobs, users = db.get_stats(); goal, raised = db.get_donations()
-    percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
+    jobs, users, stars = db.get_stats()
     limit = db.get_stat("max_pages_limit", 80)
     bot.reply_to(
         message,
-        f"🔢 <b>Live Stats</b>\n\n👥 Users: <code>{users:,}</code>\n✅ Documents delivered: <code>{jobs:,}</code>\n📄 Max Pages: <code>{limit}</code>\n\n"
-        f"💰 Server Cost\n🎯 Goal: <code>${goal}</code> | 💵 Raised: <code>${raised}</code> ({percent}%)",
+        f"🔢 <b>Live Stats</b>\n\n👥 Users: <code>{users:,}</code>\n✅ Documents delivered: <code>{jobs:,}</code>\n⭐ Stars tipped: <code>{stars:,}</code>\n📄 Max Pages: <code>{limit}</code>",
         parse_mode="HTML",
     )
-
-@bot.message_handler(commands=["support"])
-def cmd_support(message):
-    text = (
-        "☕ <b>Support the Dev</b>\n\n"
-        "Heart Over Money is completely free.\nNo ads. No trackers. No hidden fees.\n\n"
-        "Server costs come straight out of my pocket.\nIf this bot saves you time, you can buy me a coffee:\n\n"
-        f"☕ <a href='{SUPPORT_URL}'>Buy Me a Coffee</a>\n\n"
-        "Or just share the bot with a friend — that helps too. 💙"
-    )
-    bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(content_types=["text"])
 def cmd_text(message):
@@ -970,10 +992,11 @@ def main():
             logger.error(f"[warmup] Chrome failed: {e}")
     threading.Thread(target=warm, daemon=True).start()
 
-    jobs, users = db.get_stats()
+    jobs, users, stars = db.get_stats()
     logger.info("📚 Heart Over Money PDF Bot online")
     logger.info(f"   Total jobs delivered: {jobs:,}")
     logger.info(f"   Total users served:   {users:,}")
+    logger.info(f"   Total stars tipped:   {stars:,}")
 
     while True:
         try:
