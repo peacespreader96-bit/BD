@@ -42,10 +42,12 @@ DB_PATH           = "/app/bot_data.db"
 CACHE_DIR         = "/app/cache"
 PROFILE_DIR       = "/app/chrome-profile"
 
-MAX_TG_UPLOAD     = 49 * 1024 * 1024
-EXPORT_BATCH_SIZE = 4          # Bumped back to 4 for double the speed
-CDP_TIMEOUT       = 600
+MAX_TG_UPLOAD        = 49 * 1024 * 1024
+EXPORT_BATCH_SIZE    = 4
+CDP_TIMEOUT          = 600
 JOBS_BEFORE_CHROME_RESET = 30
+MAX_JOB_SECONDS      = 900          # 15-min hard cap; kills Chrome if exceeded
+MAX_CACHE_BYTES      = 400 * 1024 * 1024  # 400 MB cache ceiling
 
 SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
 
@@ -204,9 +206,7 @@ class BrowserManager:
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
-                
-                # --- SPEED FLAGS ADDED HERE ---
-                opts.add_argument("--js-flags=--max-old-space-size=128")
+                opts.add_argument("--js-flags=--max-old-space-size=192")
                 opts.add_argument("--disable-extensions")
                 opts.add_argument("--disable-background-networking")
                 opts.add_argument("--disable-default-apps")
@@ -216,7 +216,8 @@ class BrowserManager:
                 opts.add_argument("--no-first-run")
                 opts.add_argument("--safebrowsing-disable-auto-update")
                 opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
-                
+                opts.add_argument("--aggressive-cache-discard")
+                opts.add_argument("--disable-background-timer-throttling")
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option("useAutomationExtension", False)
@@ -275,6 +276,22 @@ def cache_lookup(doc_id):
 
 def cache_store(doc_id, src_path):
     os.makedirs(CACHE_DIR, exist_ok=True)
+    # Evict oldest files if over the size limit
+    try:
+        files = [os.path.join(CACHE_DIR, f) for f in os.listdir(CACHE_DIR)]
+        total = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+        if total > MAX_CACHE_BYTES:
+            for old in sorted(files, key=lambda f: os.path.getmtime(f)):
+                sz = os.path.getsize(old) if os.path.exists(old) else 0
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+                total -= sz
+                if total < MAX_CACHE_BYTES * 0.7:
+                    break
+    except Exception as e:
+        print(f"[cache evict] {e}")
     shutil.copyfile(src_path, cache_path(doc_id))
 
 # ==============================================================
@@ -318,6 +335,7 @@ def wait_for_pages(driver, timeout=60):
     """, timeout * 1000) or 0)
 
 def load_page_batch(driver, nums, timeout=120):
+    """Full blocking batch load — waits for images to complete."""
     configure_timeout(driver, timeout + 10)
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
@@ -359,6 +377,44 @@ def load_page_batch(driver, nums, timeout=120):
     """, list(nums), timeout * 1000)
     if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
+
+def preload_pages_async(driver, nums):
+    """Fire-and-forget: trigger page loads without blocking."""
+    driver.execute_script("""
+        const mgr = window.docManager;
+        if (!mgr || !mgr.pages) return;
+        for (const n of arguments[0]) {
+            const p = mgr.pages[n];
+            if (!p) continue;
+            try { p.load(); }    catch(e) {}
+            try { p.display(); } catch(e) {}
+            try { if (!p._imagesTurnedOn) p.turnOnImages(); } catch(e) {}
+        }
+    """, list(nums))
+
+def wait_for_batch_ready(driver, nums, timeout=120):
+    """Wait for already-triggered pages — does NOT call .load() again."""
+    driver.set_script_timeout(timeout + 10)
+    driver.execute_async_script("""
+        const nums = arguments[0];
+        const ms   = arguments[1];
+        const done = arguments[arguments.length - 1];
+        const mgr  = window.docManager;
+        if (!mgr || !mgr.pages) { done(null); return; }
+        const start = Date.now();
+        const t = setInterval(() => {
+            let ok = 0;
+            for (const n of nums) {
+                const p = mgr.pages[n];
+                if (!p || !p.innerPageElem) continue;
+                if (Array.from(p.innerPageElem.querySelectorAll('img')).every(i => i.complete)) ok++;
+            }
+            if (ok === nums.length || Date.now() - start >= ms) {
+                clearInterval(t);
+                done(null);
+            }
+        }, 50);
+    """, list(nums), timeout * 1000)
 
 def release_batch(driver, nums):
     driver.execute_script("""
@@ -464,13 +520,31 @@ def export_page_to_pdf(driver, index, page_count):
     })
     return base64.b64decode(result["data"])
 
+def get_batch_size(total_pages):
+    if total_pages > 150: return 2
+    if total_pages > 80:  return 3
+    return EXPORT_BATCH_SIZE
+
+def mid_job_reset(driver, embed_url):
+    """Navigate away and back to clear Chrome's render heap mid-job."""
+    try:
+        driver.get("about:blank")
+        time.sleep(0.5)
+        driver.get(embed_url)
+        wait_for_pages(driver, 60)
+        hide_cookies(driver)
+        prepare_for_print(driver)
+        configure_timeout(driver, CDP_TIMEOUT)
+        print("[mid-job reset] Done")
+    except Exception as e:
+        print(f"[mid-job reset] Failed: {e}")
+
 def fetch_scribd_pdf(url, output_path, progress_cb=None):
-    embed = embed_url_for(url)
+    embed  = embed_url_for(url)
     driver = browser.get()
 
     try:
         driver.get(embed)
-        # REMOVED time.sleep(1) - wait_for_pages handles the wait perfectly
         hide_cookies(driver)
 
         pages = wait_for_pages(driver, 60)
@@ -482,17 +556,32 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
         prepare_for_print(driver)
         configure_timeout(driver, CDP_TIMEOUT)
 
+        batch_size = get_batch_size(pages)
+
         spool = tempfile.TemporaryDirectory(prefix="scribd-pages-")
         files = []
         try:
+            batch = []
             for i in range(pages):
-                if i % EXPORT_BATCH_SIZE == 0:
-                    batch_end = min(pages, i + EXPORT_BATCH_SIZE)
+                # --- Batch boundary: load or wait ---
+                if i % batch_size == 0:
+                    batch_end = min(pages, i + batch_size)
                     batch = list(range(i + 1, batch_end + 1))
                     if progress_cb:
                         progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
-                    load_page_batch(driver, batch)
 
+                    if i == 0:
+                        load_page_batch(driver, batch)      # first batch: full wait
+                    else:
+                        wait_for_batch_ready(driver, batch) # pre-loaded last iteration
+
+                    # Pre-load NEXT batch now while we export this one
+                    next_start = batch_end + 1
+                    if next_start <= pages:
+                        nb_end = min(pages, batch_end + batch_size)
+                        preload_pages_async(driver, list(range(next_start, nb_end + 1)))
+
+                # --- Export current page ---
                 pdf_bytes = export_page_to_pdf(driver, i, pages)
                 if len(PdfReader(BytesIO(pdf_bytes)).pages) != 1:
                     raise RuntimeError(f"Page {i+1} render failed")
@@ -506,9 +595,17 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                 if progress_cb and (i + 1) % 5 == 0:
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
 
-                if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
+                # --- End of batch: release + optional mid-job reset ---
+                if (i + 1) % batch_size == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
+                    time.sleep(0.2)   # let Chrome breathe
                     gc.collect()
+
+                    # Mid-job reset every 50 pages to clear Chrome's render heap
+                    if (i + 1) % 50 == 0 and (i + 1) < pages:
+                        if progress_cb:
+                            progress_cb(f"♻️ Refreshing engine at page <b>{i+1}</b>...")
+                        mid_job_reset(driver, embed)
 
             if progress_cb:
                 progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
@@ -560,6 +657,12 @@ class QueueManager:
             self.pending.append(job)
             return len(self.pending)
 
+    def cancel_user(self, user_id):
+        with self.lock:
+            before = len(self.pending)
+            self.pending = deque(j for j in self.pending if j.user_id != user_id)
+            return before - len(self.pending)
+
     def _run(self, job):
         try:
             process_job(job)
@@ -599,7 +702,7 @@ class QueueManager:
                         message_id=wj.status_msg_id,
                         parse_mode="HTML",
                     )
-                    time.sleep(0.02) # Sped up from 0.05
+                    time.sleep(0.02)
                 except Exception:
                     pass
 
@@ -610,7 +713,6 @@ queue = QueueManager()
 # ==============================================================
 
 def safe_upload(chat_id, file_path, caption, reply_to_id):
-    """Attempts to upload a document up to 3 times."""
     for attempt in range(1, 4):
         try:
             with open(file_path, "rb") as f:
@@ -642,8 +744,16 @@ def process_job(job):
         except Exception:
             pass
 
-    start = time.time()
+    # Hard timeout: kill Chrome if job exceeds MAX_JOB_SECONDS
+    timeout_fired = threading.Event()
+    def _timeout_kill():
+        timeout_fired.set()
+        print(f"[job timeout] Killing Chrome after {MAX_JOB_SECONDS}s")
+        browser._kill()
+    timer = threading.Timer(MAX_JOB_SECONDS, _timeout_kill)
+    timer.start()
 
+    start = time.time()
     try:
         doc_id = extract_doc_id(job.url)
 
@@ -674,6 +784,10 @@ def process_job(job):
         try:
             output_pdf = os.path.join(workdir, f"scribd_{doc_id}.pdf")
             pages = fetch_scribd_pdf(job.url, output_pdf, progress_cb=edit)
+
+            if timeout_fired.is_set():
+                edit("⏳ <b>Job timed out.</b>\n\nThis document took too long. Please try a shorter one or try again.")
+                return
 
             if not os.path.exists(output_pdf):
                 raise RuntimeError("PDF generation failed")
@@ -711,12 +825,15 @@ def process_job(job):
                 try: bot.delete_message(chat_id, msg_id)
                 except Exception: pass
             else:
-                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
+                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. Please try again in a few minutes.")
 
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
     except Exception as e:
+        if timeout_fired.is_set():
+            edit("⏳ <b>Job timed out.</b>\n\nThis document took too long. Try again or try a shorter document.")
+            return
         err = str(e).lower()
         if "invalid" in err or "no printable" in err or "could not find" in err:
             friendly = "❌ <b>Couldn't fetch that document.</b>\n\nIt may be private, region-locked, or Scribd is blocking us right now. Try again in a minute."
@@ -731,6 +848,8 @@ def process_job(job):
         edit(friendly)
         print(f"[job error] {e}")
         traceback.print_exc()
+    finally:
+        timer.cancel()
 
 # ==============================================================
 # TELEGRAM HANDLERS
@@ -783,6 +902,14 @@ def cmd_start(message):
 
     bot.reply_to(message, text, parse_mode="HTML")
 
+@bot.message_handler(commands=["cancel"])
+def cmd_cancel(message):
+    removed = queue.cancel_user(message.from_user.id)
+    if removed:
+        bot.reply_to(message, "✅ <b>Removed from queue.</b>", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "ℹ️ You're not currently in the queue.", parse_mode="HTML")
+
 @bot.message_handler(commands=["setgoal"])
 def cmd_setgoal(message):
     if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
@@ -829,7 +956,8 @@ def cmd_help(message):
         "• Zero ads\n"
         "• Fair queuing (you'll see your place in line)\n"
         "• Cache — instant for repeat documents\n\n"
-        "☕ /support — keep the server running"
+        "☕ /support — keep the server running\n"
+        "❌ /cancel — leave the queue"
     )
     bot.reply_to(message, text, parse_mode="HTML")
 
@@ -903,7 +1031,7 @@ def cmd_text(message):
             f"⏳ <b>You're in line!</b>\n\n"
             f"📍 Position: <b>#{pos}</b>\n"
             f"⏱ Est. wait: ~{pos * 25}s\n\n"
-            f"<i>I'll ping you when it's your turn.</i>",
+            f"<i>Send /cancel to leave the queue.</i>",
             chat_id=message.chat.id,
             message_id=status.message_id,
             parse_mode="HTML",
