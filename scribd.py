@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Khan's Scribd Downloader — Telegram bot.
-Production-grade, MAX SPEED, quality-preserved.
+Production-grade, queue-based, cache-aware, MAX SPEED.
 """
 
 import os
@@ -43,7 +43,7 @@ CACHE_DIR         = "/app/cache"
 PROFILE_DIR       = "/app/chrome-profile"
 
 MAX_TG_UPLOAD     = 49 * 1024 * 1024
-EXPORT_BATCH_SIZE = 4
+EXPORT_BATCH_SIZE = 4          # Bumped back to 4 for double the speed
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
@@ -114,9 +114,15 @@ class Database:
             with self._conn() as c:
                 row = c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 if row:
-                    c.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
+                    c.execute(
+                        "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+                        (username, first_name, user_id),
+                    )
                     return False
-                c.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
+                c.execute(
+                    "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+                    (user_id, username, first_name),
+                )
                 c.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_users'")
                 return True
 
@@ -128,7 +134,10 @@ class Database:
     def increment_user_downloads(self, user_id):
         with self.lock:
             with self._conn() as c:
-                c.execute("UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?", (user_id,))
+                c.execute(
+                    "UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
 
     def get_stats(self):
         with self.lock:
@@ -195,36 +204,28 @@ class BrowserManager:
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
-                opts.add_argument("--js-flags=--max-old-space-size=192")
-
-                # ===== THE SPEED FLAGS =====
-                # Force Chrome to never throttle background rendering or timers
-                opts.add_argument("--disable-background-timer-throttling")
-                opts.add_argument("--disable-backgrounding-occluded-windows")
-                opts.add_argument("--disable-renderer-backgrounding")
-                opts.add_argument("--disable-ipc-flooding-protection")
-                opts.add_argument("--memory-pressure-off")
-                opts.add_argument("--disable-hang-monitor")
+                
+                # --- SPEED FLAGS ADDED HERE ---
+                opts.add_argument("--js-flags=--max-old-space-size=128")
                 opts.add_argument("--disable-extensions")
                 opts.add_argument("--disable-background-networking")
+                opts.add_argument("--disable-default-apps")
                 opts.add_argument("--disable-sync")
                 opts.add_argument("--metrics-recording-only")
                 opts.add_argument("--mute-audio")
                 opts.add_argument("--no-first-run")
                 opts.add_argument("--safebrowsing-disable-auto-update")
-                # ===========================
-
+                opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
+                
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option("useAutomationExtension", False)
                 opts.binary_location = CHROME_BIN
 
-                opts.page_load_strategy = "eager"
-
                 service = Service(executable_path=CHROMEDRIVER_PATH)
                 self.driver = webdriver.Chrome(service=service, options=opts)
                 self.jobs_since_reset = 0
-                print("[browser] Chrome launched successfully (turbo mode)")
+                print("[browser] Chrome launched successfully")
                 return
             except Exception as e:
                 print(f"[browser] Launch failed (attempt {attempt+1}): {e}")
@@ -302,7 +303,6 @@ def configure_timeout(driver, seconds):
         pass
 
 def wait_for_pages(driver, timeout=60):
-    """REVERTED: Back to the reliable polling loop."""
     driver.set_script_timeout(timeout + 5)
     return int(driver.execute_async_script("""
         const budget = arguments[0];
@@ -318,7 +318,6 @@ def wait_for_pages(driver, timeout=60):
     """, timeout * 1000) or 0)
 
 def load_page_batch(driver, nums, timeout=120):
-    """REVERTED: Back to the reliable setInterval loop."""
     configure_timeout(driver, timeout + 10)
     driver.set_script_timeout(timeout + 10)
     result = driver.execute_async_script("""
@@ -362,7 +361,6 @@ def load_page_batch(driver, nums, timeout=120):
         raise RuntimeError("Scribd docManager unavailable")
 
 def release_batch(driver, nums):
-    """Remove pages from DOM. NO GC here — we GC once at end of job."""
     driver.execute_script("""
         const mgr = window.docManager;
         if (!mgr || !mgr.pages) return;
@@ -371,6 +369,11 @@ def release_batch(driver, nums):
             if (p) { try { p.remove(); } catch (e) {} }
         }
     """, list(nums))
+    try:
+        driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
+    except Exception:
+        pass
+    gc.collect()
 
 def hide_cookies(driver):
     driver.execute_script("""
@@ -397,7 +400,6 @@ def prepare_for_print(driver):
     """)
 
 def export_page_to_pdf(driver, index, page_count):
-    """REVERTED: Back to direct style injection and ReturnAsBase64."""
     info = driver.execute_script("""
         const i = arguments[0];
         const pages = Array.from(document.querySelectorAll('.outer_page'));
@@ -468,6 +470,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
     try:
         driver.get(embed)
+        # REMOVED time.sleep(1) - wait_for_pages handles the wait perfectly
         hide_cookies(driver)
 
         pages = wait_for_pages(driver, 60)
@@ -478,7 +481,6 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
         prepare_for_print(driver)
         configure_timeout(driver, CDP_TIMEOUT)
-        driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
 
         spool = tempfile.TemporaryDirectory(prefix="scribd-pages-")
         files = []
@@ -506,13 +508,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
                 if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
-
-            # ONE GC at the end of the job
-            try:
-                driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
-            except Exception:
-                pass
-            gc.collect()
+                    gc.collect()
 
             if progress_cb:
                 progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
@@ -586,7 +582,9 @@ class QueueManager:
                 try:
                     bot.edit_message_text(
                         "🚀 <b>It's your turn!</b>\n\nStarting download now...",
-                        chat_id=chat_nex, message_id=next_id, parse_mode="HTML",
+                        chat_id=chat_nex,
+                        message_id=next_id,
+                        parse_mode="HTML",
                     )
                 except Exception:
                     pass
@@ -597,26 +595,31 @@ class QueueManager:
                         f"⏳ <b>Queue update</b>\n\n"
                         f"📍 You are now <b>#{i+1}</b> in line.\n"
                         f"<i>Thanks for your patience!</i>",
-                        chat_id=wj.chat_id, message_id=wj.status_msg_id, parse_mode="HTML",
+                        chat_id=wj.chat_id,
+                        message_id=wj.status_msg_id,
+                        parse_mode="HTML",
                     )
-                    time.sleep(0.02)
+                    time.sleep(0.02) # Sped up from 0.05
                 except Exception:
                     pass
 
 queue = QueueManager()
 
 # ==============================================================
-# UPLOAD HELPER
+# UPLOAD HELPER (RETRY LOGIC)
 # ==============================================================
 
 def safe_upload(chat_id, file_path, caption, reply_to_id):
+    """Attempts to upload a document up to 3 times."""
     for attempt in range(1, 4):
         try:
             with open(file_path, "rb") as f:
                 bot.send_document(
-                    chat_id, f, caption=caption,
+                    chat_id, f,
+                    caption=caption,
                     reply_to_message_id=reply_to_id,
-                    parse_mode="HTML", timeout=600,
+                    parse_mode="HTML",
+                    timeout=600,
                 )
             return True
         except Exception as e:
@@ -649,7 +652,9 @@ def process_job(job):
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
             success = safe_upload(
                 chat_id, cached,
-                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Delivered from cache</b>\n\n"
+                f"⚡ Fetched in under a second.\n\n"
+                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
                 job.reply_to_id,
             )
             if success:
@@ -659,6 +664,7 @@ def process_job(job):
                 except Exception: pass
                 return
             else:
+                print(f"[cache upload fail] Removing corrupt cache for {doc_id}")
                 try: os.remove(cached)
                 except Exception: pass
 
@@ -674,7 +680,10 @@ def process_job(job):
 
             size = os.path.getsize(output_pdf)
             if size > MAX_TG_UPLOAD:
-                edit(f"❌ <b>File too large</b>\n\nThe PDF is {size/1024/1024:.1f} MB — Telegram's bot limit is 50 MB.")
+                edit(
+                    f"❌ <b>File too large</b>\n\n"
+                    f"The PDF is {size/1024/1024:.1f} MB — Telegram's bot limit is 50 MB."
+                )
                 return
 
             try:
@@ -702,7 +711,8 @@ def process_job(job):
                 try: bot.delete_message(chat_id, msg_id)
                 except Exception: pass
             else:
-                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. Try again in a few minutes.")
+                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
+
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -745,9 +755,12 @@ def cmd_start(message):
         f"💵 Raised: <code>${raised}</code>\n"
         f"📊 Progress: <code>{percent}%</code>\n"
     )
+
     help_block = (
         "📖 <b>How to use</b>\n"
-        "1️⃣ Copy a Scribd link\n2️⃣ Paste it here\n3️⃣ Get your PDF!\n\n"
+        "1️⃣ Copy a Scribd link\n"
+        "2️⃣ Paste it here\n"
+        "3️⃣ Get your PDF!\n\n"
         "☕ /support — keep the server running"
     )
 
@@ -757,53 +770,73 @@ def cmd_start(message):
             f"Hey <b>{name}</b>, I turn Scribd links into beautiful PDFs in seconds.\n\n"
             f"🚫 <b>100% Free.</b> No ads. No redirects. No spam.\n"
             f"🛠 Hosted personally by the Dev.\n\n"
-            f"{stats_block}\n{help_block}"
+            f"{stats_block}\n"
+            f"{help_block}"
         )
     else:
         text = (
             f"👋 <b>Welcome back, {name}!</b>\n\n"
             f"📊 Your downloads: <code>{my_downloads:,}</code>\n\n"
-            f"{stats_block}\n{help_block}"
+            f"{stats_block}\n"
+            f"{help_block}"
         )
+
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["setgoal"])
 def cmd_setgoal(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
+        return
     parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setgoal 10")
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /setgoal 10")
+        return
     try:
-        amount = int(parts[1]); db.set_donation("donation_goal", amount)
+        amount = int(parts[1])
+        db.set_donation("donation_goal", amount)
         bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception: bot.reply_to(message, "Usage: /setgoal 10")
+    except Exception:
+        bot.reply_to(message, "Usage: /setgoal 10")
 
 @bot.message_handler(commands=["setdonation"])
 def cmd_setdonation(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
+        return
     parts = message.text.split()
-    if len(parts) < 2: return bot.reply_to(message, "Usage: /setdonation 5")
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /setdonation 5")
+        return
     try:
-        amount = int(parts[1]); db.set_donation("donation_raised", amount)
+        amount = int(parts[1])
+        db.set_donation("donation_raised", amount)
         bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception: bot.reply_to(message, "Usage: /setdonation 5")
+    except Exception:
+        bot.reply_to(message, "Usage: /setdonation 5")
 
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     text = (
         "📖 <b>How to use Khan's Scribd Downloader</b>\n\n"
-        "1️⃣ Open Scribd in your browser\n2️⃣ Copy the link\n3️⃣ Paste it here\n\n"
+        "1️⃣ Open Scribd in your browser\n"
+        "2️⃣ Copy the link of the document you want\n"
+        "3️⃣ Paste it here\n\n"
         "I'll fetch the full PDF and send it back to you.\n\n"
         "🔗 <b>Supported formats:</b>\n"
         "<code>https://www.scribd.com/document/…</code>\n"
         "<code>https://www.scribd.com/doc/…</code>\n\n"
-        "⚡ <b>Features</b>\n• Free forever\n• Zero ads\n• Fair queuing\n• Cache\n\n"
+        "⚡ <b>Features</b>\n"
+        "• Free forever\n"
+        "• Zero ads\n"
+        "• Fair queuing (you'll see your place in line)\n"
+        "• Cache — instant for repeat documents\n\n"
         "☕ /support — keep the server running"
     )
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
-    jobs, users = db.get_stats(); goal, raised = db.get_donations()
+    jobs, users = db.get_stats()
+    goal, raised = db.get_donations()
     percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
     bot.reply_to(
         message,
@@ -831,10 +864,16 @@ def cmd_support(message):
 @bot.message_handler(content_types=["text"])
 def cmd_text(message):
     text = (message.text or "").strip()
-    if text.startswith("/"): return
+    if text.startswith("/"):
+        return
 
     if not is_scribd_url(text):
-        bot.reply_to(message, "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n<code>https://www.scribd.com/document/123456789/Title</code>", parse_mode="HTML")
+        bot.reply_to(
+            message,
+            "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n"
+            "<code>https://www.scribd.com/document/123456789/Title</code>",
+            parse_mode="HTML",
+        )
         return
 
     u = message.from_user
@@ -846,13 +885,18 @@ def cmd_text(message):
         return
 
     job = Job(
-        chat_id=message.chat.id, user_id=u.id, url=text,
-        status_msg_id=status.message_id, reply_to_id=message.message_id,
+        chat_id=message.chat.id,
+        user_id=u.id,
+        url=text,
+        status_msg_id=status.message_id,
+        reply_to_id=message.message_id,
         user_name=u.first_name or "friend",
     )
 
     pos = queue.add(job)
-    if pos == 0: return
+
+    if pos == 0:
+        return
 
     try:
         bot.edit_message_text(
@@ -860,7 +904,9 @@ def cmd_text(message):
             f"📍 Position: <b>#{pos}</b>\n"
             f"⏱ Est. wait: ~{pos * 25}s\n\n"
             f"<i>I'll ping you when it's your turn.</i>",
-            chat_id=message.chat.id, message_id=status.message_id, parse_mode="HTML",
+            chat_id=message.chat.id,
+            message_id=status.message_id,
+            parse_mode="HTML",
         )
     except Exception:
         pass
