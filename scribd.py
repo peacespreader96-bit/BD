@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Khan's Scribd Downloader — Telegram bot.
-Production-grade, queue-based, cache-aware, MAX SPEED.
+Production-grade, MAX SPEED, quality-preserved.
 """
 
 import os
@@ -43,7 +43,7 @@ CACHE_DIR         = "/app/cache"
 PROFILE_DIR       = "/app/chrome-profile"
 
 MAX_TG_UPLOAD     = 49 * 1024 * 1024
-EXPORT_BATCH_SIZE = 4          # Bumped back to 4 for double the speed
+EXPORT_BATCH_SIZE = 4
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
@@ -114,15 +114,9 @@ class Database:
             with self._conn() as c:
                 row = c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
                 if row:
-                    c.execute(
-                        "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                        (username, first_name, user_id),
-                    )
+                    c.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (username, first_name, user_id))
                     return False
-                c.execute(
-                    "INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-                    (user_id, username, first_name),
-                )
+                c.execute("INSERT INTO users (user_id, username, first_name) VALUES (?, ?, ?)", (user_id, username, first_name))
                 c.execute("UPDATE stats SET value = value + 1 WHERE key = 'total_users'")
                 return True
 
@@ -134,10 +128,7 @@ class Database:
     def increment_user_downloads(self, user_id):
         with self.lock:
             with self._conn() as c:
-                c.execute(
-                    "UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?",
-                    (user_id,),
-                )
+                c.execute("UPDATE users SET total_downloads = total_downloads + 1 WHERE user_id = ?", (user_id,))
 
     def get_stats(self):
         with self.lock:
@@ -199,33 +190,41 @@ class BrowserManager:
                 opts.add_argument("--disable-dev-shm-usage")
                 opts.add_argument("--disable-gpu")
                 opts.add_argument("--window-size=1400,2000")
-                opts.add_argument("--disable-software-rasterizer")
                 opts.add_argument("--disable-blink-features=AutomationControlled")
                 opts.add_argument("--ignore-certificate-errors")
                 opts.add_argument("--force-color-profile=srgb")
                 opts.add_argument("--hide-scrollbars")
-                
-                # --- SPEED FLAGS ADDED HERE ---
-                opts.add_argument("--js-flags=--max-old-space-size=128")
+                opts.add_argument("--js-flags=--max-old-space-size=192")
+
+                # ===== THE SPEED FLAGS =====
+                # Force Chrome to never throttle background rendering or timers
+                opts.add_argument("--disable-background-timer-throttling")
+                opts.add_argument("--disable-backgrounding-occluded-windows")
+                opts.add_argument("--disable-renderer-backgrounding")
+                opts.add_argument("--disable-ipc-flooding-protection")
+                opts.add_argument("--memory-pressure-off")
+                opts.add_argument("--disable-hang-monitor")
                 opts.add_argument("--disable-extensions")
                 opts.add_argument("--disable-background-networking")
-                opts.add_argument("--disable-default-apps")
                 opts.add_argument("--disable-sync")
                 opts.add_argument("--metrics-recording-only")
                 opts.add_argument("--mute-audio")
                 opts.add_argument("--no-first-run")
                 opts.add_argument("--safebrowsing-disable-auto-update")
-                opts.add_argument("--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints")
-                
+                # ===========================
+
                 opts.add_argument(f"--user-data-dir={PROFILE_DIR}")
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
                 opts.add_experimental_option("useAutomationExtension", False)
                 opts.binary_location = CHROME_BIN
 
+                # Return as soon as DOM is ready, we handle waits manually
+                opts.page_load_strategy = "eager"
+
                 service = Service(executable_path=CHROMEDRIVER_PATH)
                 self.driver = webdriver.Chrome(service=service, options=opts)
                 self.jobs_since_reset = 0
-                print("[browser] Chrome launched successfully")
+                print("[browser] Chrome launched successfully (turbo mode)")
                 return
             except Exception as e:
                 print(f"[browser] Launch failed (attempt {attempt+1}): {e}")
@@ -302,19 +301,30 @@ def configure_timeout(driver, seconds):
     except Exception:
         pass
 
-def wait_for_pages(driver, timeout=60):
+def wait_for_pages(driver, timeout=30):
+    """MutationObserver fires the instant DOM updates — no polling throttle."""
     driver.set_script_timeout(timeout + 5)
     return int(driver.execute_async_script("""
         const budget = arguments[0];
         const done   = arguments[arguments.length - 1];
         const start  = performance.now();
-        function tick() {
+
+        const initial = document.querySelectorAll('.outer_page').length;
+        if (initial > 0) { done(initial); return; }
+
+        const observer = new MutationObserver(() => {
             const n = document.querySelectorAll('.outer_page').length;
-            if (n > 0) { done(n); return; }
-            if (performance.now() - start >= budget) { done(0); return; }
-            setTimeout(tick, 250);
-        }
-        tick();
+            if (n > 0) {
+                observer.disconnect();
+                done(n);
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        setTimeout(() => {
+            observer.disconnect();
+            done(document.querySelectorAll('.outer_page').length);
+        }, budget);
     """, timeout * 1000) or 0)
 
 def load_page_batch(driver, nums, timeout=120):
@@ -326,41 +336,51 @@ def load_page_batch(driver, nums, timeout=120):
         const done      = arguments[arguments.length - 1];
         const mgr       = window.docManager;
         if (!mgr || !mgr.pages) { done({supported: false}); return; }
-        const states = nums.map(n => ({ pageNum: n, page: mgr.pages[n], error: null }));
-        const start  = Date.now();
-        for (const s of states) {
-            if (!s.page) { s.error = 'missing'; continue; }
-            try { if (!s.page.innerPageElem) s.page.load(); }
-            catch (e) { s.error = String(e); }
-        }
-        const timer = setInterval(() => {
-            let ready = 0;
-            for (const s of states) {
-                if (s.error) { ready++; continue; }
-                const p = s.page;
-                if (!p.innerPageElem) continue;
-                try {
-                    p.display();
-                    if (!p._imagesTurnedOn) p.turnOnImages();
-                } catch (e) { s.error = String(e); ready++; continue; }
+
+        async function processPage(n) {
+            const p = mgr.pages[n];
+            if (!p) return { pageNum: n, error: 'missing' };
+            try {
+                if (!p.innerPageElem) p.load();
+                if (!p.innerPageElem) {
+                    await new Promise(resolve => {
+                        const check = setInterval(() => {
+                            if (p.innerPageElem) { clearInterval(check); resolve(); }
+                        }, 50);
+                        setTimeout(() => { clearInterval(check); resolve(); }, timeoutMs);
+                    });
+                }
+                if (!p.innerPageElem) return { pageNum: n, error: 'timeout' };
+
+                p.display();
+                if (!p._imagesTurnedOn) p.turnOnImages();
+
                 const imgs = Array.from(p.innerPageElem.querySelectorAll('img'));
-                if (imgs.every(i => i.complete)) ready++;
+                // Event-driven image wait instead of polling
+                await Promise.all(imgs.map(img => {
+                    if (img.complete) return Promise.resolve();
+                    return new Promise(resolve => {
+                        img.addEventListener('load', resolve);
+                        img.addEventListener('error', resolve);
+                        setTimeout(resolve, 5000); // 5s max per image
+                    });
+                }));
+                return { pageNum: n, error: null };
+            } catch (e) {
+                return { pageNum: n, error: String(e) };
             }
-            if (ready === states.length) {
-                clearInterval(timer);
-                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error}))});
-                return;
-            }
-            if (Date.now() - start >= timeoutMs) {
-                clearInterval(timer);
-                done({supported: true, failed: states.filter(s => s.error).map(s => ({n: s.pageNum, r: s.error || 'timeout'}))});
-            }
-        }, 50);
+        }
+
+        Promise.all(nums.map(processPage)).then(results => {
+            const failed = results.filter(r => r.error);
+            done({ supported: true, failed });
+        });
     """, list(nums), timeout * 1000)
     if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
 
 def release_batch(driver, nums):
+    """Remove pages from DOM. NO GC here — we GC once at end of job."""
     driver.execute_script("""
         const mgr = window.docManager;
         if (!mgr || !mgr.pages) return;
@@ -369,11 +389,6 @@ def release_batch(driver, nums):
             if (p) { try { p.remove(); } catch (e) {} }
         }
     """, list(nums))
-    try:
-        driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
-    except Exception:
-        pass
-    gc.collect()
 
 def hide_cookies(driver):
     driver.execute_script("""
@@ -386,6 +401,8 @@ def hide_cookies(driver):
     """)
 
 def prepare_for_print(driver):
+    # Set media type once, not 65 times
+    driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
     driver.execute_script("""
         const top = document.querySelector('.toolbar_top');    if (top) top.remove();
         const bot = document.querySelector('.toolbar_bottom'); if (bot) bot.remove();
@@ -397,35 +414,21 @@ def prepare_for_print(driver):
             el.style.margin    = '0';
             el.style.padding   = '0';
         });
-    """)
-
-def export_page_to_pdf(driver, index, page_count):
-    info = driver.execute_script("""
-        const i = arguments[0];
-        const pages = Array.from(document.querySelectorAll('.outer_page'));
-        const target = pages[i];
-        if (!target) return null;
+        
         const old = document.getElementById('isolated-print-css');
         if (old) old.remove();
-        pages.forEach(p => {
-            ['display','visibility','position','top','left','right','bottom','margin',
-             'break-after','page-break-after','break-before','page-break-before']
-                .forEach(prop => p.style.removeProperty(prop));
-        });
-        const r = target.getBoundingClientRect();
-        const w = Math.ceil(r.width);
-        const h = Math.ceil(r.height);
-        pages.forEach(p => p.removeAttribute('data-export-target'));
-        target.setAttribute('data-export-target','true');
+        
         const s = document.createElement('style');
         s.id = 'isolated-print-css';
+        // CSS variables are much faster to update per-page
         s.textContent = `
-            @page { size: ${w}px ${h}px; margin: 0; }
+            :root { --pdf-w: 800px; --pdf-h: 1100px; }
+            @page { size: var(--pdf-w) var(--pdf-h); margin: 0; }
             @media print {
                 html, body {
-                    width: ${w}px !important; height: ${h}px !important;
-                    min-width: ${w}px !important; min-height: ${h}px !important;
-                    max-width: ${w}px !important; max-height: ${h}px !important;
+                    width: var(--pdf-w) !important; height: var(--pdf-h) !important;
+                    min-width: var(--pdf-w) !important; min-height: var(--pdf-h) !important;
+                    max-width: var(--pdf-w) !important; max-height: var(--pdf-h) !important;
                     margin: 0 !important; padding: 0 !important;
                     overflow: hidden !important;
                     -webkit-print-color-adjust: exact !important;
@@ -436,20 +439,42 @@ def export_page_to_pdf(driver, index, page_count):
                     display: block !important; visibility: visible !important;
                     position: absolute !important;
                     top: 0 !important; left: 0 !important;
-                    width: ${w}px !important; height: ${h}px !important;
+                    width: var(--pdf-w) !important; height: var(--pdf-h) !important;
                     margin: 0 !important; padding: 0 !important;
                     overflow: hidden !important;
                 }
             }
         `;
         document.head.appendChild(s);
+    """)
+
+def export_page_to_pdf(driver, index, page_count):
+    info = driver.execute_script("""
+        const i = arguments[0];
+        const pages = document.querySelectorAll('.outer_page');
+        const target = pages[i];
+        if (!target) return null;
+
+        const r = target.getBoundingClientRect();
+        const w = Math.ceil(r.width);
+        const h = Math.ceil(r.height);
+
+        const old = document.querySelector('.outer_page[data-export-target="true"]');
+        if (old) old.removeAttribute('data-export-target');
+        
+        target.setAttribute('data-export-target','true');
+        document.documentElement.style.setProperty('--pdf-w', w + 'px');
+        document.documentElement.style.setProperty('--pdf-h', h + 'px');
+        
         return { width: w, height: h };
     """, index)
     if not info:
         raise RuntimeError(f"Page {index+1}/{page_count} missing")
+        
     w_in = int(info["width"]) / 96.0
     h_in = int(info["height"]) / 96.0
-    driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
+    
+    # ReturnAsStream skips the heavy Base64 encoding process entirely
     result = driver.execute_cdp_cmd("Page.printToPDF", {
         "landscape": False,
         "displayHeaderFooter": False,
@@ -460,9 +485,25 @@ def export_page_to_pdf(driver, index, page_count):
         "marginTop": 0, "marginBottom": 0, "marginLeft": 0, "marginRight": 0,
         "preferCSSPageSize": True,
         "pageRanges": "1",
-        "transferMode": "ReturnAsBase64",
+        "transferMode": "ReturnAsStream",
     })
-    return base64.b64decode(result["data"])
+    
+    # Read binary stream directly
+    stream_handle = result["stream"]
+    pdf_bytes = b""
+    while True:
+        chunk = driver.execute_cdp_cmd("IO.read", {"handle": stream_handle, "size": 1024*1024})
+        data = chunk.get("data", "")
+        if data:
+            if chunk.get("base64Encoded"):
+                pdf_bytes += base64.b64decode(data)
+            else:
+                pdf_bytes += data.encode("utf-8")
+        if chunk.get("eof"):
+            break
+            
+    driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
+    return pdf_bytes
 
 def fetch_scribd_pdf(url, output_path, progress_cb=None):
     embed = embed_url_for(url)
@@ -470,10 +511,9 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
     try:
         driver.get(embed)
-        # REMOVED time.sleep(1) - wait_for_pages handles the wait perfectly
         hide_cookies(driver)
 
-        pages = wait_for_pages(driver, 60)
+        pages = wait_for_pages(driver, 30)
         if pages <= 0:
             raise RuntimeError("No printable pages detected")
         if progress_cb:
@@ -506,9 +546,16 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                 if progress_cb and (i + 1) % 5 == 0:
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
 
+                # Only release pages from DOM — no slow GC per batch
                 if (i + 1) % EXPORT_BATCH_SIZE == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
-                    gc.collect()
+
+            # ONE GC at the end of the job instead of 3x per batch
+            try:
+                driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
+            except Exception:
+                pass
+            gc.collect()
 
             if progress_cb:
                 progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
@@ -582,9 +629,7 @@ class QueueManager:
                 try:
                     bot.edit_message_text(
                         "🚀 <b>It's your turn!</b>\n\nStarting download now...",
-                        chat_id=chat_nex,
-                        message_id=next_id,
-                        parse_mode="HTML",
+                        chat_id=chat_nex, message_id=next_id, parse_mode="HTML",
                     )
                 except Exception:
                     pass
@@ -595,31 +640,26 @@ class QueueManager:
                         f"⏳ <b>Queue update</b>\n\n"
                         f"📍 You are now <b>#{i+1}</b> in line.\n"
                         f"<i>Thanks for your patience!</i>",
-                        chat_id=wj.chat_id,
-                        message_id=wj.status_msg_id,
-                        parse_mode="HTML",
+                        chat_id=wj.chat_id, message_id=wj.status_msg_id, parse_mode="HTML",
                     )
-                    time.sleep(0.02) # Sped up from 0.05
+                    time.sleep(0.02)
                 except Exception:
                     pass
 
 queue = QueueManager()
 
 # ==============================================================
-# UPLOAD HELPER (RETRY LOGIC)
+# UPLOAD HELPER
 # ==============================================================
 
 def safe_upload(chat_id, file_path, caption, reply_to_id):
-    """Attempts to upload a document up to 3 times."""
     for attempt in range(1, 4):
         try:
             with open(file_path, "rb") as f:
                 bot.send_document(
-                    chat_id, f,
-                    caption=caption,
+                    chat_id, f, caption=caption,
                     reply_to_message_id=reply_to_id,
-                    parse_mode="HTML",
-                    timeout=600,
+                    parse_mode="HTML", timeout=600,
                 )
             return True
         except Exception as e:
@@ -652,9 +692,7 @@ def process_job(job):
             edit("⚡ <b>Found in cache!</b>\n\nSending instantly...")
             success = safe_upload(
                 chat_id, cached,
-                f"✅ <b>Delivered from cache</b>\n\n"
-                f"⚡ Fetched in under a second.\n\n"
-                f"☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
+                f"✅ <b>Delivered from cache</b>\n\n⚡ Fetched in under a second.\n\n☕ <a href='{SUPPORT_URL}'>Support the Dev</a>",
                 job.reply_to_id,
             )
             if success:
@@ -664,7 +702,6 @@ def process_job(job):
                 except Exception: pass
                 return
             else:
-                print(f"[cache upload fail] Removing corrupt cache for {doc_id}")
                 try: os.remove(cached)
                 except Exception: pass
 
@@ -680,10 +717,7 @@ def process_job(job):
 
             size = os.path.getsize(output_pdf)
             if size > MAX_TG_UPLOAD:
-                edit(
-                    f"❌ <b>File too large</b>\n\n"
-                    f"The PDF is {size/1024/1024:.1f} MB — Telegram's bot limit is 50 MB."
-                )
+                edit(f"❌ <b>File too large</b>\n\nThe PDF is {size/1024/1024:.1f} MB — Telegram's bot limit is 50 MB.")
                 return
 
             try:
@@ -711,8 +745,7 @@ def process_job(job):
                 try: bot.delete_message(chat_id, msg_id)
                 except Exception: pass
             else:
-                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
-
+                edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. Try again in a few minutes.")
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -755,12 +788,9 @@ def cmd_start(message):
         f"💵 Raised: <code>${raised}</code>\n"
         f"📊 Progress: <code>{percent}%</code>\n"
     )
-
     help_block = (
         "📖 <b>How to use</b>\n"
-        "1️⃣ Copy a Scribd link\n"
-        "2️⃣ Paste it here\n"
-        "3️⃣ Get your PDF!\n\n"
+        "1️⃣ Copy a Scribd link\n2️⃣ Paste it here\n3️⃣ Get your PDF!\n\n"
         "☕ /support — keep the server running"
     )
 
@@ -770,73 +800,53 @@ def cmd_start(message):
             f"Hey <b>{name}</b>, I turn Scribd links into beautiful PDFs in seconds.\n\n"
             f"🚫 <b>100% Free.</b> No ads. No redirects. No spam.\n"
             f"🛠 Hosted personally by the Dev.\n\n"
-            f"{stats_block}\n"
-            f"{help_block}"
+            f"{stats_block}\n{help_block}"
         )
     else:
         text = (
             f"👋 <b>Welcome back, {name}!</b>\n\n"
             f"📊 Your downloads: <code>{my_downloads:,}</code>\n\n"
-            f"{stats_block}\n"
-            f"{help_block}"
+            f"{stats_block}\n{help_block}"
         )
-
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["setgoal"])
 def cmd_setgoal(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
-        return
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
     parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage: /setgoal 10")
-        return
+    if len(parts) < 2: return bot.reply_to(message, "Usage: /setgoal 10")
     try:
-        amount = int(parts[1])
-        db.set_donation("donation_goal", amount)
+        amount = int(parts[1]); db.set_donation("donation_goal", amount)
         bot.reply_to(message, f"✅ Donation goal updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception:
-        bot.reply_to(message, "Usage: /setgoal 10")
+    except Exception: bot.reply_to(message, "Usage: /setgoal 10")
 
 @bot.message_handler(commands=["setdonation"])
 def cmd_setdonation(message):
-    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
-        return
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID: return
     parts = message.text.split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Usage: /setdonation 5")
-        return
+    if len(parts) < 2: return bot.reply_to(message, "Usage: /setdonation 5")
     try:
-        amount = int(parts[1])
-        db.set_donation("donation_raised", amount)
+        amount = int(parts[1]); db.set_donation("donation_raised", amount)
         bot.reply_to(message, f"✅ Donations updated to <b>${amount}</b>.", parse_mode="HTML")
-    except Exception:
-        bot.reply_to(message, "Usage: /setdonation 5")
+    except Exception: bot.reply_to(message, "Usage: /setdonation 5")
 
 @bot.message_handler(commands=["help"])
 def cmd_help(message):
     text = (
         "📖 <b>How to use Khan's Scribd Downloader</b>\n\n"
-        "1️⃣ Open Scribd in your browser\n"
-        "2️⃣ Copy the link of the document you want\n"
-        "3️⃣ Paste it here\n\n"
+        "1️⃣ Open Scribd in your browser\n2️⃣ Copy the link\n3️⃣ Paste it here\n\n"
         "I'll fetch the full PDF and send it back to you.\n\n"
         "🔗 <b>Supported formats:</b>\n"
         "<code>https://www.scribd.com/document/…</code>\n"
         "<code>https://www.scribd.com/doc/…</code>\n\n"
-        "⚡ <b>Features</b>\n"
-        "• Free forever\n"
-        "• Zero ads\n"
-        "• Fair queuing (you'll see your place in line)\n"
-        "• Cache — instant for repeat documents\n\n"
+        "⚡ <b>Features</b>\n• Free forever\n• Zero ads\n• Fair queuing\n• Cache\n\n"
         "☕ /support — keep the server running"
     )
     bot.reply_to(message, text, parse_mode="HTML")
 
 @bot.message_handler(commands=["stats"])
 def cmd_stats(message):
-    jobs, users = db.get_stats()
-    goal, raised = db.get_donations()
+    jobs, users = db.get_stats(); goal, raised = db.get_donations()
     percent = min(100, int((raised / goal * 100)) if goal > 0 else 0)
     bot.reply_to(
         message,
@@ -864,16 +874,10 @@ def cmd_support(message):
 @bot.message_handler(content_types=["text"])
 def cmd_text(message):
     text = (message.text or "").strip()
-    if text.startswith("/"):
-        return
+    if text.startswith("/"): return
 
     if not is_scribd_url(text):
-        bot.reply_to(
-            message,
-            "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n"
-            "<code>https://www.scribd.com/document/123456789/Title</code>",
-            parse_mode="HTML",
-        )
+        bot.reply_to(message, "❌ <b>Invalid link</b>\n\nPlease send a Scribd URL like:\n<code>https://www.scribd.com/document/123456789/Title</code>", parse_mode="HTML")
         return
 
     u = message.from_user
@@ -885,18 +889,13 @@ def cmd_text(message):
         return
 
     job = Job(
-        chat_id=message.chat.id,
-        user_id=u.id,
-        url=text,
-        status_msg_id=status.message_id,
-        reply_to_id=message.message_id,
+        chat_id=message.chat.id, user_id=u.id, url=text,
+        status_msg_id=status.message_id, reply_to_id=message.message_id,
         user_name=u.first_name or "friend",
     )
 
     pos = queue.add(job)
-
-    if pos == 0:
-        return
+    if pos == 0: return
 
     try:
         bot.edit_message_text(
@@ -904,9 +903,7 @@ def cmd_text(message):
             f"📍 Position: <b>#{pos}</b>\n"
             f"⏱ Est. wait: ~{pos * 25}s\n\n"
             f"<i>I'll ping you when it's your turn.</i>",
-            chat_id=message.chat.id,
-            message_id=status.message_id,
-            parse_mode="HTML",
+            chat_id=message.chat.id, message_id=status.message_id, parse_mode="HTML",
         )
     except Exception:
         pass
