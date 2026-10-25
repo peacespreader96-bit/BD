@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Khan's Scribd Downloader — Telegram bot.
-Production-grade, queue-based, cache-aware, MAX SPEED.
+Production-grade, queue-based, cache-aware, MAX SPEED, Loggable.
 """
 
 import os
@@ -13,6 +13,7 @@ import html
 import base64
 import shutil
 import sqlite3
+import logging
 import tempfile
 import threading
 import traceback
@@ -47,24 +48,34 @@ EXPORT_BATCH_SIZE = 4
 CDP_TIMEOUT       = 600
 JOBS_BEFORE_CHROME_RESET = 30
 
-MAX_JOB_SECONDS   = 900
+MAX_JOB_SECONDS   = 1200
 MAX_CACHE_BYTES   = 400 * 1024 * 1024
-LAST_JOB_DURATION = 30.0  # Tracks previous job speed for dynamic queue estimates
+LAST_JOB_DURATION = 30.0
 
 SUPPORT_URL = "https://buymeacoffee.com/yourusername"  # <-- EDIT THIS
 
 # ==============================================================
-# UTILITIES
+# LOGGING SETUP
 # ==============================================================
 
-def format_duration(seconds):
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    mins = int(seconds // 60)
-    secs = int(seconds % 60)
-    if secs == 0:
-        return f"{mins}m"
-    return f"{mins}m {secs}s"
+log_buffer = deque(maxlen=150)
+
+class MemoryLogHandler(logging.Handler):
+    def emit(self, record):
+        log_buffer.append(self.format(record))
+
+logger = logging.getLogger("scribd")
+logger.setLevel(logging.INFO)
+
+# Console output
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(console_handler)
+
+# In-memory output for /log
+memory_handler = MemoryLogHandler()
+memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(memory_handler)
 
 # ==============================================================
 # TELEGRAM
@@ -239,10 +250,10 @@ class BrowserManager:
                 service = Service(executable_path=CHROMEDRIVER_PATH)
                 self.driver = webdriver.Chrome(service=service, options=opts)
                 self.jobs_since_reset = 0
-                print("[browser] Chrome launched successfully")
+                logger.info("[browser] Chrome launched successfully")
                 return
             except Exception as e:
-                print(f"[browser] Launch failed (attempt {attempt+1}): {e}")
+                logger.error(f"[browser] Launch failed (attempt {attempt+1}): {e}")
                 self._kill()
                 time.sleep(2)
         raise RuntimeError("Chrome failed to launch after 3 attempts")
@@ -260,7 +271,7 @@ class BrowserManager:
     def maybe_restart(self):
         self.jobs_since_reset += 1
         if self.jobs_since_reset >= JOBS_BEFORE_CHROME_RESET:
-            print("[browser] Periodic restart to free memory")
+            logger.info("[browser] Periodic restart to free memory")
             self._kill()
             self._launch()
 
@@ -388,6 +399,7 @@ def load_page_batch(driver, nums, timeout=120):
     """, list(nums), timeout * 1000)
     if not result or not isinstance(result, dict) or not result.get("supported"):
         raise RuntimeError("Scribd docManager unavailable")
+    return result
 
 def preload_pages_async(driver, nums):
     """Trigger page loads without waiting — fire and forget."""
@@ -404,13 +416,13 @@ def preload_pages_async(driver, nums):
     """, list(nums))
 
 def wait_for_batch_ready(driver, nums, timeout=120):
-    """Wait for already-triggered pages — doesn't re-call .load()."""
+    """Wait for already-triggered pages. Returns True if successful, False if timeout."""
     driver.set_script_timeout(timeout + 10)
-    driver.execute_async_script("""
+    result = driver.execute_async_script("""
         const nums = arguments[0], ms = arguments[1];
         const done = arguments[arguments.length - 1];
         const mgr = window.docManager;
-        if (!mgr || !mgr.pages) { done(null); return; }
+        if (!mgr || !mgr.pages) { done(false); return; }
         const start = Date.now();
         const t = setInterval(() => {
             let ok = 0;
@@ -419,11 +431,14 @@ def wait_for_batch_ready(driver, nums, timeout=120):
                 if (!p || !p.innerPageElem) continue;
                 if (Array.from(p.innerPageElem.querySelectorAll('img')).every(i => i.complete)) ok++;
             }
-            if (ok === nums.length || Date.now() - start >= ms) {
-                clearInterval(t); done(null);
+            if (ok === nums.length) {
+                clearInterval(t); done(true);
+            } else if (Date.now() - start >= ms) {
+                clearInterval(t); done(false);
             }
         }, 50);
     """, list(nums), timeout * 1000)
+    return bool(result)
 
 def release_batch(driver, nums):
     driver.execute_script("""
@@ -474,7 +489,7 @@ def mid_job_reset(driver, embed_url):
         prepare_for_print(driver)
         configure_timeout(driver, CDP_TIMEOUT)
     except Exception as e:
-        print(f"[mid-job reset] {e}")
+        logger.error(f"[mid-job reset] {e}")
 
 def export_page_to_pdf(driver, index, page_count):
     info = driver.execute_script("""
@@ -573,10 +588,17 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                         progress_cb(f"🖼️ Rendering pages <b>{i+1}–{batch_end}/{pages}</b>...")
 
                     if i == 0 or just_reset:
-                        load_page_batch(driver, batch)
+                        res = load_page_batch(driver, batch)
                         just_reset = False
                     else:
-                        wait_for_batch_ready(driver, batch)
+                        if not wait_for_batch_ready(driver, batch):
+                            logger.warning(f"Batch {i+1}-{batch_end} timed out during wait. Forcing reload.")
+                            res = load_page_batch(driver, batch)
+                        else:
+                            res = {"failed": []}
+
+                    if res.get("failed"):
+                        logger.warning(f"Some pages in batch failed: {res['failed']}")
 
                     # Fire off NEXT batch NOW while we start exporting this one
                     next_start = batch_end + 1
@@ -598,6 +620,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
 
                 if progress_cb and (i + 1) % 5 == 0:
                     progress_cb(f"✅ Exported <b>{i+1}/{pages}</b> pages...")
+                    logger.info(f"Exported {i+1}/{pages}")
 
                 if (i + 1) % batch_size == 0 or (i + 1) == pages:
                     release_batch(driver, batch)
@@ -607,11 +630,13 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
                     if (i + 1) % 50 == 0 and (i + 1) < pages:
                         if progress_cb:
                             progress_cb(f"♻️ Refreshing engine at page <b>{i+1}</b>...")
+                        logger.info(f"Refreshing Chrome at page {i+1}")
                         mid_job_reset(driver, embed)
                         just_reset = True
 
             if progress_cb:
                 progress_cb(f"🧩 Stitching <b>{len(files)}</b> pages...")
+            logger.info(f"Stitching {len(files)} pages into PDF")
 
             writer = PdfWriter()
             try:
@@ -628,7 +653,7 @@ def fetch_scribd_pdf(url, output_path, progress_cb=None):
             browser.reset_between_jobs()
             browser.maybe_restart()
         except Exception as ex:
-            print(f"[browser restart error] {ex}")
+            logger.error(f"[browser restart error] {ex}")
 
     return pages
 
@@ -664,7 +689,7 @@ class QueueManager:
         try:
             process_job(job)
         except Exception:
-            traceback.print_exc()
+            logger.error(f"Queue error: {traceback.format_exc()}")
         finally:
             with self.lock:
                 self.active = None
@@ -688,10 +713,8 @@ class QueueManager:
                     pass
 
             for i, wj in enumerate(remaining):
-                # Dynamic live wait calculation
                 estimated_wait = LAST_JOB_DURATION * (i + 1)
                 wait_str = format_duration(estimated_wait)
-                
                 try:
                     bot.edit_message_text(
                         f"⏳ <b>Queue update</b>\n\n"
@@ -705,6 +728,15 @@ class QueueManager:
                     pass
 
 queue = QueueManager()
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    mins = int(seconds // 60)
+    secs = int(seconds % 60)
+    if secs == 0:
+        return f"{mins}m"
+    return f"{mins}m {secs}s"
 
 # ==============================================================
 # UPLOAD HELPER
@@ -721,7 +753,7 @@ def safe_upload(chat_id, file_path, caption, reply_to_id):
                 )
             return True
         except Exception as e:
-            print(f"[upload attempt {attempt}] Failed: {e}")
+            logger.error(f"[upload attempt {attempt}] Failed: {e}")
             if attempt < 3:
                 time.sleep(3)
     return False
@@ -740,7 +772,7 @@ def process_job(job):
     def timeout_handler():
         nonlocal timeout_occurred
         timeout_occurred = True
-        print(f"[timeout] Job exceeded {MAX_JOB_SECONDS}s. Killing Chrome.")
+        logger.error(f"[timeout] Job exceeded {MAX_JOB_SECONDS}s. Killing Chrome.")
         browser._kill()
 
     timer = threading.Timer(MAX_JOB_SECONDS, timeout_handler)
@@ -754,6 +786,7 @@ def process_job(job):
 
     try:
         doc_id = extract_doc_id(job.url)
+        logger.info(f"New Job: {doc_id}")
 
         cached = cache_lookup(doc_id)
         if cached:
@@ -772,7 +805,7 @@ def process_job(job):
                 except Exception: pass
                 return
             else:
-                print(f"[cache upload fail] Removing corrupt cache for {doc_id}")
+                logger.warning(f"[cache upload fail] Removing corrupt cache for {doc_id}")
                 try: os.remove(cached)
                 except Exception: pass
 
@@ -793,8 +826,8 @@ def process_job(job):
 
             try:
                 cache_store(doc_id, output_pdf)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Cache store failed: {e}")
 
             elapsed = time.time() - start
             edit("📤 <b>Uploading to Telegram...</b>")
@@ -816,9 +849,9 @@ def process_job(job):
                 try: bot.delete_message(chat_id, msg_id)
                 except Exception: pass
                 
-                # Update duration tracker for accurate queue estimates
                 if not timeout_occurred and elapsed > 5:
                     LAST_JOB_DURATION = elapsed
+                    logger.info(f"Job finished in {elapsed:.1f}s")
             else:
                 edit("❌ <b>Upload failed.</b>\n\nTelegram is rejecting the connection. The server is busy. Please try again in a few minutes.")
 
@@ -840,14 +873,25 @@ def process_job(job):
         else:
             friendly = "❌ <b>Something went wrong.</b>\n\nPlease try again in a moment."
         edit(friendly)
-        print(f"[job error] {e}")
-        traceback.print_exc()
+        logger.error(f"[job error] {traceback.format_exc()}")
     finally:
         timer.cancel()
 
 # ==============================================================
 # TELEGRAM HANDLERS
 # ==============================================================
+
+@bot.message_handler(commands=["log"])
+def cmd_log(message):
+    if not ADMIN_ID or str(message.from_user.id) != ADMIN_ID:
+        return
+    if not log_buffer:
+        bot.reply_to(message, "No logs yet.")
+        return
+    text = "\n".join(log_buffer)
+    if len(text) > 4000:
+        text = "... (truncated)\n" + text[-4000:]
+    bot.reply_to(message, f"<b>System Logs:</b>\n<pre>{html.escape(text)}</pre>", parse_mode="HTML")
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -1012,7 +1056,6 @@ def cmd_text(message):
     if pos == 0:
         return
 
-    # Dynamic wait time for new joiners
     estimated_wait = LAST_JOB_DURATION * pos
     wait_str = format_duration(estimated_wait)
 
@@ -1035,34 +1078,33 @@ def cmd_text(message):
 
 def main():
     if not BOT_TOKEN:
-        print("!! BOT_TOKEN not set")
+        logger.error("!! BOT_TOKEN not set")
         sys.exit(1)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
     threading.Thread(target=start_health_server, daemon=True).start()
-    print(f"[health] listening on :{PORT}")
+    logger.info(f"[health] listening on :{PORT}")
 
     def warm():
         try:
             browser.get()
-            print("[warmup] Chrome ready")
+            logger.info("[warmup] Chrome ready")
         except Exception as e:
-            print(f"[warmup] Chrome failed: {e}")
+            logger.error(f"[warmup] Chrome failed: {e}")
     threading.Thread(target=warm, daemon=True).start()
 
     jobs, users = db.get_stats()
-    print("📚 Khan's Scribd Downloader online")
-    print(f"   Total jobs delivered: {jobs:,}")
-    print(f"   Total users served:   {users:,}")
+    logger.info("📚 Khan's Scribd Downloader online")
+    logger.info(f"   Total jobs delivered: {jobs:,}")
+    logger.info(f"   Total users served:   {users:,}")
 
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=50)
         except Exception as e:
-            print(f"[polling] crashed: {e}")
-            traceback.print_exc()
+            logger.error(f"[polling] crashed: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
